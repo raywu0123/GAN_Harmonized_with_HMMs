@@ -3,22 +3,22 @@ import os
 
 
 from lib import data_load
-from sup_model import SupModel
-from uns_model import UnsModel
+from models import MODEL_HUB
+from evalution import frame_eval
 
 
-def addParser():
+def add_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', help='')
-    parser.add_argument('--model_type', type=str, default='uns', help='')
+    parser.add_argument('--model_type', type=str, default='uns_bert', help='')
     parser.add_argument('--cuda_id', type=str, default='0', help='')
     parser.add_argument('--bnd_type', type=str, default='orc', help='')
     parser.add_argument('--setting', type=str, default='match', help='')
     parser.add_argument('--iteration', type=int, default=1, help='')
     parser.add_argument('--aug', action='store_true', help='')
-    parser.add_argument('--data_dir', type=str, default=f'/home/guanyu/guanyu/handoff/data')
-    parser.add_argument('--save_dir', type=str, default=f'/home/guanyu/guanyu/handoff/data/save/test_model')
-    parser.add_argument('--config', type=str, default=f'/home/guanyu/guanyu/handoff/src/GAN-based-model/config.yaml')
+    parser.add_argument('--data_dir', type=str)
+    parser.add_argument('--save_dir', type=str)
+    parser.add_argument('--config', type=str)
     return parser
 
 
@@ -134,10 +134,7 @@ def main(args, config):
     config.save_path = f'{args.save_dir}/model'
 
     # build model
-    if args.model_type == 'sup':
-        g = SupModel(config)
-    else:
-        g = UnsModel(config)
+    g = MODEL_HUB[args.model_type](config)
     print_bar()
     print_model_parameter(config)
 
@@ -149,24 +146,32 @@ def main(args, config):
         print_training_parameter(args, config)
         g.train(config, train_data_loader, dev_data_loader)
         print_training_parameter(args, config)
-        g.output_framewise_prob(f'{args.save_dir}/train.pkl', train_data_loader)
-        g.output_framewise_prob(f'{args.save_dir}/test.pkl', dev_data_loader)
-
     elif args.mode == 'load':
         print_training_parameter(args, config)
         g.restore(args.save_dir)
         g.train(config, train_data_loader, dev_data_loader)
         print_training_parameter(args, config)
-        g.output_framewise_prob(f'{args.save_dir}/train.pkl', train_data_loader)
-        g.output_framewise_prob(f'{args.save_dir}/test.pkl', dev_data_loader)
     else:
         g.restore(args.save_dir)
-        g.output_framewise_prob(f'{args.save_dir}/train.pkl', train_data_loader)
-        g.output_framewise_prob(f'{args.save_dir}/test.pkl', dev_data_loader)
+
+    frame_eval(
+        g.predict_batch,
+        train_data_loader,
+        batch_size=config.batch_size,
+        dump=True,
+        output_path=f'{args.save_dir}/train.pkl',
+    )
+    frame_eval(
+        g.predict_batch,
+        dev_data_loader,
+        batch_size=config.batch_size,
+        dump=True,
+        output_path=f'{args.save_dir}/test.pkl',
+    )
 
 
 if __name__ == "__main__":
-    parser = addParser()
+    parser = add_parser()
     args = parser.parse_args()
     config = data_load.read_config(args.config)
     main(args, config)

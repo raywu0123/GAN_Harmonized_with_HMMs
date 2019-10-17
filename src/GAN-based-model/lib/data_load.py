@@ -12,7 +12,7 @@ class AttrDict(dict):
 
 
 def read_config(path):
-    return AttrDict(yaml.load(open(path, 'r')))
+    return AttrDict(yaml.load(open(path, 'r'), Loader=yaml.FullLoader))
 
 
 class DataLoader:
@@ -136,12 +136,14 @@ class DataLoader:
 
     def process_label(self, oracle_bound, phoneme, meta):
         """
-        label: boundaries, phonomes
+        label: boundaries, phonemes
         """
         self.frame_label = np.zeros(shape=[self.data_length, self.feat_max_length], dtype='int32')
         self.orc_bnd = np.array(oracle_bound)
-        self.phn_label = phoneme
-
+        self.sample_phn_label = np.asarray([
+            [self.phn2idx[p] for p in phn_seq]
+            for phn_seq in phoneme
+        ])
         # parse prefix-string to labels, description below
         # https://catalog.ldc.upenn.edu/docs/LDC93S1/timit.readme.html?fbclid=IwAR3DEnjodNL10CaOQCMtQHWovY3I5Hh9JaMYpoHYW-Bz0r6_fXTowH6fjw8
         prefixes = meta
@@ -203,18 +205,39 @@ class DataLoader:
     def get_sample_batch(self, batch_size, repeat=1):
         batch_size = batch_size // 2
         batch_idx = np.random.choice(self.data_length, batch_size, replace=False)
-        batch_idx = np.tile(batch_idx, (repeat))
-        random_pick = np.clip(np.random.normal(0.5, 0.2, [batch_size * 2 * repeat, self.phn_max_length]), 0.0, 1.0)
+        batch_idx = np.tile(batch_idx, repeat)
+        random_pick = np.clip(
+            np.random.normal(
+                0.5,
+                0.2,
+                [batch_size * 2 * repeat, self.phn_max_length]
+            ),
+            0.0,
+            1.0,
+        )
         sample_frame = np.around(
-            np.tile(self.train_bnd[batch_idx], (2, 1)) + random_pick * np.tile(self.train_bnd_range[batch_idx],
-                                                                               (2, 1))).astype('int32')
+            np.tile(self.train_bnd[batch_idx], (2, 1)) +
+            random_pick * np.tile(
+                self.train_bnd_range[batch_idx], (2, 1)
+            )
+        ).astype('int32')
         sample_source = np.tile(self.source_data[batch_idx], (2, 1, 1))[
-            np.arange(batch_size * 2 * repeat).reshape([-1, 1]), sample_frame]
+            np.arange(batch_size * 2 * repeat).reshape([-1, 1]), sample_frame
+        ]
         repeat_num = np.sum(
-            np.not_equal(sample_frame[:batch_size * repeat], sample_frame[batch_size * repeat:]).astype(np.int32),
-            axis=1)
-
-        return sample_source, np.tile(self.train_seq_length[batch_idx], (2)), repeat_num
+            np.not_equal(
+                sample_frame[:batch_size * repeat],
+                sample_frame[batch_size * repeat:],
+            ).astype(np.int32),
+            axis=1,
+        )
+        sample_phn_label = self.sample_phn_label[batch_idx]
+        return (
+            sample_source,
+            np.tile(self.train_seq_length[batch_idx], 2),
+            repeat_num,
+            np.tile(sample_phn_label, 2),
+        )
 
     def get_target_batch(self, batch_size):
         batch_idx = np.random.choice(self.target_data_length, batch_size, replace=False)
@@ -275,4 +298,3 @@ class DataLoader:
                 'text_type_label': batch_text_type_label,
                 'sentence_label': batch_sentence_label,
             }
-
