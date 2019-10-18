@@ -96,3 +96,10 @@ def inter_segment_loss(logits, mask):
     JSD = torch.mean(JSDs)
     return -JSD
 
+
+def gumbel_sample(logits):
+    U = torch.empty_like(logits).uniform_()
+    gumbel_noise = -torch.log(torch.log(U + epsilon) + epsilon)
+    logits = logits + gumbel_noise
+    p = torch.softmax(logits, dim=-1)
+    return torch.argmax(p, dim=-1, keepdim=True)
