@@ -28,8 +28,12 @@ class SupModel(ModelBase):
                 self.frame_temp = tf.placeholder(tf.float32, shape=[])
 
             with tf.variable_scope('generator'):
-                self.frame_prob, _, frame_log_prob = frame2phn(self.frame_feat, args, args.sample_temp,
-                                                               input_len=self.frame_len)
+                self.frame_prob, _, frame_log_prob = frame2phn(
+                    self.frame_feat,
+                    args,
+                    args.frame_temp,
+                    input_len=self.frame_len,
+                )
 
             if train:
                 self.learning_rate = tf.placeholder(tf.float32, shape=[])
@@ -65,12 +69,15 @@ class SupModel(ModelBase):
         max_fer = 100.0
 
         for epoch in range(1, args.epoch + 1):
-            for batch_frame_feat, batch_frame_label, batch_frame_len in data_loader.get_batch(args.batch_size):
+            for batch in data_loader.get_batch(args.batch_size):
+                batch_frame_feat = batch['source']
+                batch_frame_label = batch['frame_label']
+                batch_frame_len = batch['source_length']
                 feed_dict = {
                     self.frame_feat: batch_frame_feat,
                     self.frame_label: batch_frame_label,
                     self.frame_len: batch_frame_len,
-                    self.learning_rate: args.sup_lr_rate
+                    self.learning_rate: args.sup_lr,
                 }
                 run_list = [self.seq_loss, self.train_op]
                 seq_loss, _ = self.sess.run(run_list, feed_dict=feed_dict)
