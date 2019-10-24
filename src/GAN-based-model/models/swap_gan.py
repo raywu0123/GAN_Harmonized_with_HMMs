@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 
 import torch
 from torch import nn
@@ -17,22 +18,24 @@ from lib.torch_utils import (
     first_order_expand,
     intra_segment_loss,
 )
+from lib.utils import array_to_string
 from evalution import frame_eval
+from callbacks import Logger
 
 
 class SwapGANModel(ModelBase):
     description = "SWAPGAN MODEL"
 
-    def __init__(self, config):
+    def __init__(self, config, wgan=True):
         self.config = config
-        self.align_layer_idx = -1
+        self.wgan = wgan
 
         cout_word = f'{self.description}: building    '
         sys.stdout.write(cout_word)
         sys.stdout.flush()
 
         self.generator = Generator(config)
-        self.critic = Critic(config)
+        self.critic = Critic(config, wgan=wgan)
 
         self.g_opt = torch.optim.Adam(
             params=self.generator.parameters(),
@@ -68,7 +71,7 @@ class SwapGANModel(ModelBase):
             get_target_batch = data_loader.get_target_batch
 
         batch_size = config.batch_size * config.repeat
-        step_c_loss, step_g_loss, step_seg_loss = 0., 0., 0.
+        logger = Logger(print_step=config.print_step)
         max_fer = 100.0
 
         for step in range(1, config.step + 1):
@@ -90,11 +93,14 @@ class SwapGANModel(ModelBase):
                 real_score = self.critic(real_target_idx)
                 fake_score = self.critic(fake_target_idx)
 
-                c_loss = torch.mean(-torch.log(real_score + epsilon)) + \
-                    torch.mean(-torch.log(1 - fake_score + epsilon))
+                if not self.wgan:
+                    c_loss = torch.mean(-torch.log(real_score + epsilon)) + \
+                        torch.mean(-torch.log(1 - fake_score + epsilon))
+                else:
+                    c_loss = torch.mean(-real_score) + torch.mean(fake_score)
                 c_loss.backward()
                 self.c_opt.step()
-                step_c_loss += c_loss.item() / config.dis_iter / config.print_step
+                logger.update({'c_loss': c_loss.item()})
 
             self.generator.train()
             self.critic.eval()
@@ -122,29 +128,22 @@ class SwapGANModel(ModelBase):
                 total_loss = g_loss + config.seg_loss_ratio * segment_loss
                 total_loss.backward()
 
-                # nn.utils.clip_grad_norm_(self.generator.parameters(), 5.)
                 self.g_opt.step()
-                step_g_loss += g_loss.item() / config.gen_iter / config.print_step
-                step_seg_loss += segment_loss.item() / config.gen_iter / config.print_step
+                logger.update({
+                    'g_loss': g_loss.item(),
+                    'seg_loss': segment_loss.item(),
+                    'true_sample': array_to_string(real_target_idx[0].cpu().data.numpy()),
+                    'fake_sample': array_to_string(fake_target_idx[0].cpu().data.numpy()),
+                })
 
             self.critic.train()
-            if step % config.print_step == 0:
-                print(
-                    f'Step: {step:5d} '
-                    f'c_loss: {step_c_loss:.4f} '
-                    f'g_loss: {step_g_loss:.4f} '
-                    f'seg_loss: {step_seg_loss:.4f} '
-                    f'fake_reward: {self.critic.ema.average.item():.4f} '
-                )
-                print(f'true sample: {real_target_idx[0].cpu().data.numpy()}')
-                print(f'fake sample: {fake_target_idx[0].cpu().data.numpy()}')
-                step_c_loss, step_g_loss, step_seg_loss = 0., 0., 0.
-
             if step % config.eval_step == 0:
                 step_fer = frame_eval(self.predict_batch, dev_data_loader)
+                logger.update({'val_fer': step_fer}, ema=False)
                 print(f'EVAL max: {max_fer:.2f} step: {step_fer:.2f}')
                 if step_fer < max_fer:
                     max_fer = step_fer
+            logger.step()
 
         print('=' * 80)
 
@@ -185,6 +184,7 @@ class Generator(nn.Module):
         x = self.dense_in(x)
         x = torch.relu(x)
         logits = self.dense_out(x)
+        logits = logits * mask.unsqueeze(2)
         idx = gumbel_sample(logits) * mask.long()  # shape: (N, T)
         return logits, idx
 
@@ -209,8 +209,9 @@ class Generator(nn.Module):
 
 class Critic(nn.Module):
 
-    def __init__(self, config, kernel_sizes=(3, 5, 7, 9)):
+    def __init__(self, config, kernel_sizes=(3, 5, 7, 9), wgan=False):
         super().__init__()
+        self.wgan = wgan
         self.kernel_sizes = kernel_sizes
         self.ema = EMA(0.9)
         self.embedding = nn.Embedding(config.phn_size, embedding_dim=config.dis_emb_size)
@@ -249,18 +250,20 @@ class Critic(nn.Module):
 
         e = e.view(N, E, T)
         outputs = torch.cat([
-            conv(e) for conv in self.first_convs
+            self.activation(conv(e)) / math.sqrt(conv.kernel_size[0]) for conv in self.first_convs
         ], dim=1)
-        outputs = self.activation(outputs)
+        outputs = outputs / math.sqrt(len(self.kernel_sizes))
         outputs = torch.cat([
-            conv(outputs) for conv in self.second_convs
+            self.activation(conv(outputs)) / math.sqrt(conv.kernel_size[0]) for conv in self.second_convs
         ], dim=1)
-        outputs = self.activation(outputs)
-        # outputs = torch.mean(outputs, dim=-1)
+        outputs = outputs / math.sqrt(len(self.kernel_sizes))
+
         outputs = outputs.view(outputs.shape[0], -1)
         outputs = self.dense(outputs)
-        score = torch.sigmoid(outputs)
-        return score
+        if not self.wgan:
+            return torch.sigmoid(outputs)
+        else:
+            return outputs
 
     def get_emb_vecs(self):
         assert(self.e is not None)
@@ -280,7 +283,10 @@ class Critic(nn.Module):
         return torch.softmax(-2. * square_dist, dim=0)
 
     def compute_G_reward(self, fake_score):
-        reward = torch.log(fake_score + epsilon)
+        if not self.wgan:
+            reward = torch.log(fake_score + epsilon)
+        else:
+            reward = fake_score
         mean_reward = torch.mean(reward)
         emb_vecs = self.get_emb_vecs()  # shape: (N, T, E)
         N = reward.shape[0]

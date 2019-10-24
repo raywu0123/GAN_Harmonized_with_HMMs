@@ -10,6 +10,7 @@ from pytorch_pretrained_bert.modeling import (
     BertLayer,
 )
 from pytorch_pretrained_bert.optimization import BertAdam
+from callbacks import Logger
 import numpy as np
 
 from .base import ModelBase
@@ -77,8 +78,8 @@ class UnsBertModel(ModelBase):
         else:
             get_target_batch = data_loader.get_target_batch
 
+        logger = Logger()
         batch_size = config.batch_size * config.repeat
-        step_feat_loss, step_intra_segment_loss, step_inter_segment_loss, step_target_loss = 0., 0., 0., 0.
         max_err = 100.0
 
         for step in range(1, config.step + 1):
@@ -95,20 +96,13 @@ class UnsBertModel(ModelBase):
             total_loss.backward()
             self.optimizer.step()
 
-            step_feat_loss += feat_loss.item() / config.print_step
-            step_intra_segment_loss += intra_s_loss.item() / config.print_step
-            step_inter_segment_loss += inter_s_loss.item() / config.print_step
-            step_target_loss += target_loss.item() / config.print_step
-            if step % config.print_step == 0:
-                print(
-                    f'Step: {step:5d} '
-                    f'feat_loss: {step_feat_loss:.2f} '
-                    f'intra_segment_loss: {step_intra_segment_loss:.2f} '
-                    f'inter_segment_loss: {step_inter_segment_loss:.2f} '
-                    f'target_loss: {step_target_loss:.2f}'
-                )
-                step_feat_loss, step_intra_segment_loss, step_inter_segment_loss, step_target_loss = 0., 0., 0., 0.
-
+            logger.update({
+                'feat_loss': feat_loss.item(),
+                'intra_s_loss': intra_s_loss.item(),
+                'inter_s_loss': inter_s_loss.item(),
+                'target_loss': target_loss.item(),
+                'total_loss': total_loss.item(),
+            })
             if step % config.eval_step == 0:
                 step_err, labels, preds = self.phn_eval(
                     data_loader,
@@ -116,11 +110,16 @@ class UnsBertModel(ModelBase):
                     repeat=config.repeat,
                 )
                 print(f'EVAL max: {max_err:.2f} step: {step_err:.2f}')
-                print(f'LABEL  : {" ".join(["%3s" % str(l) for l in labels[0]])}')
-                print(f'PREDICT: {" ".join(["%3s" % str(p) for p in preds[0]])}')
+                logger.update({'val_per': step_err}, ema=False)
+                logger.update({
+                    "LABEL": " ".join(["%3s" % str(l) for l in labels[0]]),
+                    "PREDICT": " ".join(["%3s" % str(p) for p in preds[0]]),
+                }, ema=False)
                 if step_err < max_err:
                     max_err = step_err
                     self.save(config.save_path)
+
+            logger.step()
 
         print('=' * 80)
 
