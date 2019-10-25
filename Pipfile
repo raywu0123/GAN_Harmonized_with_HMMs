@@ -15,6 +15,7 @@ tensorflow = "==1.13.1"
 "flake8" = "*"
 pytorch-pretrained-bert = "*"
 jiwer = "*"
+tensorboardx = "*"
 
 [requires]
 python_version = "3.6"

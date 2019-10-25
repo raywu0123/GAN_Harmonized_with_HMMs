@@ -1,4 +1,5 @@
 import torch
+from torch import nn
 import numpy as np
 
 epsilon = 1e-8
@@ -96,3 +97,41 @@ def inter_segment_loss(logits, mask):
     JSD = torch.mean(JSDs)
     return -JSD
 
+
+def gumbel_sample(logits):
+    U = torch.empty_like(logits).uniform_(epsilon, 1 - epsilon)
+    gumbel_noise = -torch.log(-torch.log(U))
+    logits = logits + gumbel_noise
+    return torch.argmax(logits, dim=-1)
+
+
+class EMA(nn.Module):
+
+    def __init__(self, decay_rate):
+        super(EMA, self).__init__()
+        self.decay_rate = decay_rate
+        self.decay_rate_power = 1
+        self.average = nn.Parameter(torch.Tensor([0]), requires_grad=False)
+
+    def forward(self, x):
+        self.decay_rate_power *= self.decay_rate
+        self.average.data = self.decay_rate * self.average + (1 - self.decay_rate) * x
+        return self.average / (1 - self.decay_rate_power)
+
+
+def create_attention_mask(lens: np.array, max_len: int):
+    """
+    :param lens: shape (N,)
+    convert sequence lengths to sequence masks
+    mask: shape:(N, T)
+    """
+    lens = torch.Tensor(lens).long()
+    mask = (torch.arange(max_len).expand(len(lens), max_len) < lens.unsqueeze(1)).float()
+    mask = get_tensor_from_array(mask).detach()
+    return mask
+
+
+def first_order_expand(grad, word_vecs, embeddings):
+    first_order_y = torch.einsum('nte,ve->ntv', grad, embeddings)
+    first_order_y -= torch.sum(grad * word_vecs, dim=-1, keepdim=True)
+    return first_order_y
