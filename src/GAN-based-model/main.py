@@ -1,6 +1,10 @@
 import argparse
 import os
 
+import random
+import numpy as np
+import tensorflow as tf
+import torch
 
 from lib import data_load
 from models import MODEL_HUB
@@ -19,6 +23,7 @@ def add_parser():
     parser.add_argument('--data_dir', type=str)
     parser.add_argument('--save_dir', type=str)
     parser.add_argument('--config', type=str)
+    parser.add_argument('--random_seed', type=int, default=0)
     return parser
 
 
@@ -44,7 +49,7 @@ def print_training_parameter(args, config):
     if args.model_type == 'sup':
         print(f'   epoch:                  {config.epoch}')
         print(f'   learning rate(sup):     {config.sup_lr}')
-    elif args.model_type == 'uns':
+    else:
         print(f'   repeat:                 {config.repeat}')
         print(f'   step:                   {config.step}')
         print(f'   learning rate(gen):     {config.gen_lr}')
@@ -66,6 +71,11 @@ def main(args, config):
 
     train_bnd_path = f'{args.data_dir}/timit_for_GAN/audio/timit-train-{args.bnd_type}{args.iteration}-bnd.pkl'
     phn_map_path = f'{args.data_dir}/phones.60-48-39.map.txt'
+
+    random.seed(args.random_seed)
+    np.random.seed(args.random_seed)
+    tf.set_random_seed(args.random_seed)
+    torch.random.manual_seed(args.random_seed)
 
     if args.setting == 'match':
         data_length = None  # Whole Source

@@ -26,7 +26,7 @@ from callbacks import Logger
 class SwapGANModel(ModelBase):
     description = "SWAPGAN MODEL"
 
-    def __init__(self, config, wgan=True):
+    def __init__(self, config, wgan=False):
         self.config = config
         self.wgan = wgan
 
@@ -100,7 +100,10 @@ class SwapGANModel(ModelBase):
                     c_loss = torch.mean(-real_score) + torch.mean(fake_score)
                 c_loss.backward()
                 self.c_opt.step()
-                logger.update({'c_loss': c_loss.item()})
+                logger.update({
+                    'c_loss': c_loss.item(),
+                    'true_sample': array_to_string(real_target_idx[0].cpu().data.numpy()),
+                })
 
             self.generator.train()
             self.critic.eval()
@@ -132,8 +135,8 @@ class SwapGANModel(ModelBase):
                 logger.update({
                     'g_loss': g_loss.item(),
                     'seg_loss': segment_loss.item(),
-                    'true_sample': array_to_string(real_target_idx[0].cpu().data.numpy()),
                     'fake_sample': array_to_string(fake_target_idx[0].cpu().data.numpy()),
+                    'baseline': self.critic.ema.average.item(),
                 })
 
             self.critic.train()
@@ -178,17 +181,20 @@ class Generator(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense_in = nn.Linear(config.feat_dim, config.gen_hidden_size)
+        self.hidden = nn.Linear(config.gen_hidden_size, config.gen_hidden_size)
         self.dense_out = nn.Linear(config.gen_hidden_size, config.phn_size)
 
     def forward(self, x, mask):
         x = self.dense_in(x)
+        x = torch.relu(x)
+        x = self.hidden(x)
         x = torch.relu(x)
         logits = self.dense_out(x)
         logits = logits * mask.unsqueeze(2)
         idx = gumbel_sample(logits) * mask.long()  # shape: (N, T)
         return logits, idx
 
-    def compute_loss(self, reward, kernel, target_logits, target_idx, mask, normalize_type=1):
+    def compute_loss(self, reward, kernel, target_logits, target_idx, mask, normalize_type=0):
         target_probs = torch.softmax(target_logits, dim=-1)  # shape: (N, T, V)
         batch_kernel = F.embedding(input=target_idx, weight=kernel)  # shape: (N, T, V)
         if normalize_type == 1:
