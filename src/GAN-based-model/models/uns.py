@@ -1,6 +1,7 @@
 import sys
 
 import tensorflow as tf
+import numpy as np
 
 from evalution import (
     frame_eval
@@ -19,6 +20,8 @@ from lib.tf_utils import (
     build_session,
     predict_batch,
 )
+from lib.utils import array_to_string
+from callbacks import Logger
 
 
 class UnsModel(ModelBase):
@@ -151,14 +154,11 @@ class UnsModel(ModelBase):
                     zip(clipped_gradients, self.gen_variables)
                 )
 
-        self.sess, self.saver = self.build_session()
+        self.sess, self.saver = build_session(self.graph)
         sys.stdout.write('\b' * len(cout_word))
         cout_word = 'UNSUPERVISED MODEL: finish     '
         sys.stdout.write(cout_word + '\n')
         sys.stdout.flush()
-
-    def build_session(self):
-        return build_session(self.graph)
 
     def train(
         self,
@@ -174,7 +174,7 @@ class UnsModel(ModelBase):
             get_target_batch = data_loader.get_target_batch
 
         batch_size = config.batch_size * config.repeat
-        step_gen_loss, step_dis_loss, step_seg_loss = 0.0, 0.0, 0.0
+        logger = Logger(print_step=config.print_step)
         max_fer = 100.0
         frame_temp = 0.9
         for step in range(1, config.step + 1):
@@ -201,6 +201,7 @@ class UnsModel(ModelBase):
 
                 run_list = [self.dis_loss, self.train_dis_op]
                 dis_loss, _ = self.sess.run(run_list, feed_dict=feed_dict)
+                logger.update({'dis_loss': float(dis_loss)})
 
             for _ in range(config.gen_iter):
                 batch_sample_feat, batch_sample_len, batch_repeat_num, _ = data_loader.get_sample_batch(
@@ -220,27 +221,21 @@ class UnsModel(ModelBase):
                 }
 
                 run_list = [self.gen_loss, self.seg_loss, self.train_gen_op, self.fake_sample]
-                gen_loss, seg_loss, _, smaple = self.sess.run(run_list, feed_dict=feed_dict)
-
-            step_gen_loss += gen_loss / config.print_step
-            step_dis_loss += dis_loss / config.print_step
-            step_seg_loss += seg_loss / config.print_step
-
-            if step % config.print_step == 0:
-                print(
-                    f'Step: {step:5d} '
-                    f'dis_loss: {step_gen_loss:.4f} '
-                    f'gen_loss: {step_dis_loss:.4f} '
-                    f'seg_loss: {step_seg_loss:.4f}'
-                )
-                step_gen_loss, step_dis_loss, step_seg_loss = 0.0, 0.0, 0.0
+                gen_loss, seg_loss, _, sample = self.sess.run(run_list, feed_dict=feed_dict)
+                logger.update({
+                    'gen_loss': float(gen_loss),
+                    'seg_loss': float(seg_loss),
+                    'fake_sample': array_to_string(np.argmax(sample[0], axis=-1)),
+                })
 
             if step % config.eval_step == 0:
                 step_fer = frame_eval(self.predict_batch, dev_data_loader)
                 print(f'EVAL max: {max_fer:.2f} step: {step_fer:.2f}')
+                logger.update({'val_fer': step_fer}, ema=False)
                 if step_fer < max_fer:
                     max_fer = step_fer
                     self.saver.save(self.sess, config.save_path)
+            logger.step()
 
         print('=' * 80)
 

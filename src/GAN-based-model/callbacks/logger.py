@@ -15,7 +15,7 @@ class Logger:
 
     def update(self, items: dict, ema=True):
         for key, val in items.items():
-            if key not in self.values or ema:
+            if key not in self.values or not ema:
                 self.values[key] = val
             else:
                 try:
