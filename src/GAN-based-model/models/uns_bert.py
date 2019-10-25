@@ -17,10 +17,13 @@ from .base import ModelBase
 from lib.torch_utils import (
     get_tensor_from_array,
     masked_reduce_mean,
-    l2_loss,
     cpc_loss,
     intra_segment_loss,
     inter_segment_loss,
+)
+from lib.torch_bert_utils import (
+    get_mlm_masks,
+    get_attention_mask,
 )
 from evalution import phn_eval
 
@@ -221,8 +224,8 @@ class BertModel(BertPreTrainedModel):
     def predict_feats(self, input_feats, seq_lens, repeats):
         input_feats = get_tensor_from_array(input_feats)
         repeats = get_tensor_from_array(repeats)
-        attention_mask = self.create_attention_mask(seq_lens, input_feats.shape[1])
-        input_mask, predict_mask = self.get_masks(input_feats, self.mask_prob, self.mask_but_no_prob)
+        attention_mask = get_attention_mask(seq_lens, input_feats.shape[1])
+        input_mask, predict_mask = get_mlm_masks(input_feats, self.mask_prob, self.mask_but_no_prob)
 
         masked_input_feats = input_mask * input_feats + (1 - input_mask) * self.feat_mask_vec
         masked_input_feats *= attention_mask.unsqueeze(2)  # taking care of the paddings
@@ -234,7 +237,6 @@ class BertModel(BertPreTrainedModel):
 
         to_predict = (1 - predict_mask.squeeze()) * attention_mask  # shape: (N, T)
         loss = cpc_loss(output, input_feats, to_predict, attention_mask)
-        # loss = loss + l2_loss(output, input_feats, attention_mask)
 
         translation_inner = self.translate(feat_inner)
         translated_logits = self.forward(translation_inner, attention_mask, start_layer_idx=self.translate_layer_idx)
@@ -248,9 +250,9 @@ class BertModel(BertPreTrainedModel):
 
     def predict_targets(self, input_targets, seq_lens):
         input_targets = get_tensor_from_array(input_targets)
-        attention_mask = self.create_attention_mask(seq_lens, input_targets.shape[1])
+        attention_mask = get_attention_mask(seq_lens, input_targets.shape[1])
 
-        input_mask, predict_mask = self.get_masks(input_targets, self.mask_prob, self.mask_but_no_prob)
+        input_mask, predict_mask = get_mlm_masks(input_targets, self.mask_prob, self.mask_but_no_prob)
         masked_input_targets = input_targets * input_mask + self.mask_token * (1 - input_mask)
         masked_input_targets *= attention_mask
         masked_input_targets = masked_input_targets.long()
@@ -273,13 +275,13 @@ class BertModel(BertPreTrainedModel):
             target_idx, target_lens,
     ):
         feats = get_tensor_from_array(feats)
-        feat_attention_mask = self.create_attention_mask(feat_lens, feats.shape[1])
+        feat_attention_mask = get_attention_mask(feat_lens, feats.shape[1])
         feat_embedding = self.feat_embeddings(feats)
         feat_inner = self.forward(feat_embedding, feat_attention_mask, end_layer_idx=self.translate_layer_idx)
         self.update_shadow_variable(self.shadow_feat_inner, feat_inner, feat_attention_mask)
 
         target_idx = get_tensor_from_array(target_idx).long()
-        target_attention_mask = self.create_attention_mask(target_lens, target_idx.shape[1])
+        target_attention_mask = get_attention_mask(target_lens, target_idx.shape[1])
         target_embedding = self.target_embeddings(target_idx)
         target_inner = self.forward(target_embedding, target_attention_mask, end_layer_idx=self.translate_layer_idx)
         self.update_shadow_variable(self.shadow_target_inner, target_inner, target_attention_mask)
@@ -288,42 +290,6 @@ class BertModel(BertPreTrainedModel):
         output = self.forward(translated_feat_inner, feat_attention_mask, start_layer_idx=self.translate_layer_idx)
         output = self.target_out_layer(output)
         return output
-
-    @staticmethod
-    def create_attention_mask(lens: np.array, max_len: int):
-        """
-        :param lens: shape (N,)
-        convert sequence lengths to sequence masks
-        mask: shape:(N, T)
-        """
-        lens = torch.Tensor(lens).long()
-        mask = (torch.arange(max_len).expand(len(lens), max_len) < lens.unsqueeze(1)).float()
-        mask = get_tensor_from_array(mask)
-        return mask
-
-    @staticmethod
-    def get_seq_mask(inp: torch.Tensor, mask_prob: float):
-        """
-        create mask for mask-lm
-        :return: shape: (N, T) or (N, T, 1) according to rank of inp
-        0: masked,
-        doesn't take care of the padding at the end
-        """
-        if inp.ndimension() == 3:
-            rank2 = inp[:, :, 0]
-        else:
-            rank2 = inp
-        mask = (torch.empty_like(rank2, dtype=torch.float).uniform_() > mask_prob).float()
-        if inp.ndimension() == 3:
-            mask = mask.unsqueeze(2)
-        return mask
-
-    @classmethod
-    def get_masks(cls, inp: torch.Tensor, mask_prob, mask_but_no_prob):
-        predict_mask = cls.get_seq_mask(inp, mask_prob)  # mask_prob of 0s
-        temp_mask = cls.get_seq_mask(inp, mask_but_no_prob)
-        input_mask = 1 - (1 - predict_mask) * temp_mask  # fewer 0s
-        return input_mask, predict_mask
 
     def forward(self, embedding_output, attention_mask, start_layer_idx=0, end_layer_idx=None):
         if attention_mask is None:

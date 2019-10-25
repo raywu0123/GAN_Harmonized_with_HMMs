@@ -16,6 +16,7 @@ tensorflow = "==1.13.1"
 pytorch-pretrained-bert = "*"
 jiwer = "*"
 tensorboardx = "*"
+torch = "*"
 
 [requires]
 python_version = "3.6"
