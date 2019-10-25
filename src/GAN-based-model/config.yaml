@@ -25,11 +25,11 @@ phn_max_length: 75
 feat_max_length: 777
 concat_window: 11
 sample_var: 0.15
-repeat: 6
+repeat: 1
 
 # Train
-batch_size: 50
-epoch: 2000 # for supervised training 
+batch_size: 10
+epoch: 20 # for supervised training
 step: 10000 # for unsupervised training 
 print_step: 10
 eval_step: 20

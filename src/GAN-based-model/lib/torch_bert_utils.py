@@ -33,8 +33,8 @@ def get_seq_mask(inp: torch.Tensor, mask_prob: float):
     return mask
 
 
-def get_mlm_masks(cls, inp: torch.Tensor, mask_prob, mask_but_no_prob):
-    predict_mask = cls.get_seq_mask(inp, mask_prob)  # mask_prob of 0s
-    temp_mask = cls.get_seq_mask(inp, mask_but_no_prob)
+def get_mlm_masks(inp: torch.Tensor, mask_prob, mask_but_no_prob):
+    predict_mask = get_seq_mask(inp, mask_prob)  # mask_prob of 0s
+    temp_mask = get_seq_mask(inp, mask_but_no_prob)
     input_mask = 1 - (1 - predict_mask) * temp_mask  # fewer 0s
     return input_mask, predict_mask

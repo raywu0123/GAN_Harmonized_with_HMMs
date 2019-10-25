@@ -8,12 +8,13 @@ class Logger:
         self.decay_rate = decay_rate
         self._step = 1
         self.values = {}
+        self.group_name = {}
         if tensorboard:
             self.writer = SummaryWriter(logdir=logdir)
         else:
             self.writer = None
 
-    def update(self, items: dict, ema=True):
+    def update(self, items: dict, ema=True, group_name=None):
         for key, val in items.items():
             if key not in self.values or not ema:
                 self.values[key] = val
@@ -22,6 +23,9 @@ class Logger:
                     self.values[key] = self.values[key] * self.decay_rate + val * (1 - self.decay_rate)
                 except TypeError:
                     self.values[key] = val
+
+            if group_name is not None:
+                self.group_name[key] = group_name
 
     def step(self):
         if self._step % self.print_step == 0:
@@ -43,4 +47,7 @@ class Logger:
     def log_tensorboard(self):
         for key, val in self.values.items():
             if isinstance(val, (int, float)):
-                self.writer.add_scalar(key, val, global_step=self._step)
+                if key in self.group_name:
+                    self.writer.add_scalar(f'{self.group_name[key]}/{key}', val, global_step=self._step)
+                else:
+                    self.writer.add_scalar(key, val, global_step=self._step)

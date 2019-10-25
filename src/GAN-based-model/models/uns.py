@@ -201,7 +201,7 @@ class UnsModel(ModelBase):
 
                 run_list = [self.dis_loss, self.train_dis_op]
                 dis_loss, _ = self.sess.run(run_list, feed_dict=feed_dict)
-                logger.update({'dis_loss': float(dis_loss)})
+                logger.update({'c_loss': float(dis_loss)})
 
             for _ in range(config.gen_iter):
                 batch_sample_feat, batch_sample_len, batch_repeat_num, _ = data_loader.get_sample_batch(
@@ -223,7 +223,7 @@ class UnsModel(ModelBase):
                 run_list = [self.gen_loss, self.seg_loss, self.train_gen_op, self.fake_sample]
                 gen_loss, seg_loss, _, sample = self.sess.run(run_list, feed_dict=feed_dict)
                 logger.update({
-                    'gen_loss': float(gen_loss),
+                    'g_loss': float(gen_loss),
                     'seg_loss': float(seg_loss),
                     'fake_sample': array_to_string(np.argmax(sample[0], axis=-1)),
                 })

@@ -15,11 +15,13 @@ from .base import ModelBase
 from lib.torch_utils import (
     get_tensor_from_array,
     cpc_loss,
+    masked_reduce_mean,
 )
 from lib.torch_bert_utils import (
     get_attention_mask,
     get_mlm_masks,
 )
+from callbacks import Logger
 
 
 class DataEfficientBert(ModelBase):
@@ -71,13 +73,14 @@ class DataEfficientBert(ModelBase):
     ):
         print('TRAINING(unsupervised)...')
         batch_size = config.batch_size * config.repeat
-
+        logger = Logger(config.print_step)
         print('Pretraining...')
         self.pretrain(
             data_loader=data_loader,
             dev_data_loader=dev_data_loader,
             batch_size=batch_size,
             config=config,
+            logger=logger
         )
         print('Finetuning...')
         self.finetune(
@@ -85,6 +88,7 @@ class DataEfficientBert(ModelBase):
             dev_data_loader=dev_data_loader,
             batch_size=batch_size,
             config=config,
+            logger=logger,
             aug=aug,
         )
         print('=' * 80)
@@ -117,20 +121,54 @@ class DataEfficientBert(ModelBase):
         self.bert_model.train()
         return frame_prob
 
-    def pretrain(self, data_loader, dev_data_loader, batch_size, config):
-        for i_step in range(1, config.step + 1):
-            batch = data_loader.get_batch(batch_size)
-            batch_frame_feat, batch_frame_len = batch['source'], batch['source_length']
-            self.optimizer.zero_grad()
-            loss = self.bert_model.pretrain_loss(batch_frame_feat, batch_frame_len)
-            loss.backward()
-            self.optimizer.step()
+    def pretrain(self, data_loader, dev_data_loader, batch_size, config, logger):
+        i_step = 0
+        for i_epoch in range(1, config.epoch + 1):
+            for batch in data_loader.get_batch(batch_size):
+                batch_frame_feat, batch_frame_len = batch['source'], batch['source_length']
+                self.optimizer.zero_grad()
+                loss = self.bert_model.pretrain_loss(batch_frame_feat, batch_frame_len)
+                loss.backward()
+                self.optimizer.step()
+                logger.update({'train_loss': loss.item()}, group_name='pretrain')
+                if i_step % config.eval_step:
+                    self.pretrain_eval(dev_data_loader, batch_size, logger)
+                logger.step()
+                i_step += 1
 
-    def finetune(self, data_loader, dev_data_loader, batch_size, config, aug):
-        if aug:
-            get_target_batch = data_loader.get_aug_target_batch
-        else:
-            get_target_batch = data_loader.get_target_batch
+    def pretrain_eval(self, dev_data_loader, batch_size, logger):
+        self.bert_model.eval()
+        with torch.no_grad():
+            for batch in dev_data_loader.get_batch(batch_size):
+                batch_frame_feat, batch_frame_len = batch['source'], batch['source_length']
+                loss = self.bert_model.pretrain_loss(batch_frame_feat, batch_frame_len)
+                logger.update({'val_loss': loss.item()}, group_name='pretrain')
+        self.bert_model.train()
+
+    def finetune(self, data_loader, dev_data_loader, batch_size, config, logger, aug):
+        i_step = 0
+        for i_epoch in range(1, config.epoch + 1):
+            for batch in data_loader.get_batch(batch_size):
+                batch_frame_feat, batch_frame_label, batch_frame_len = \
+                    batch['source'], batch['frame_label'], batch['source_length']
+                loss = self.bert_model.finetune_loss(batch_frame_feat, batch_frame_label, batch_frame_len)
+                loss.backward()
+                self.optimizer.step()
+                logger.update({'train_loss': loss.item()}, group_name='finetune')
+                if i_step % config.eval_step:
+                    self.finetune_eval(dev_data_loader, batch_size, logger)
+                logger.step()
+                i_step += 1
+
+    def finetune_eval(self, dev_data_loader, batch_size, logger):
+        self.bert_model.eval()
+        with torch.no_grad():
+            for batch in dev_data_loader.get_batch(batch_size):
+                batch_frame_feat, batch_frame_label, batch_frame_len = \
+                    batch['source'], batch['frame_label'], batch['source_length']
+                loss = self.bert_model.finetune_loss(batch_frame_feat, batch_frame_label, batch_frame_len)
+                logger.update({'val_loss': loss.item()}, group_name='finetune')
+        self.bert_model.train()
 
     def phn_eval(self, data_loader, batch_size, repeat):
         pass
@@ -153,11 +191,7 @@ class BertModel(BertPreTrainedModel):
         self.sep_size = sep_size
 
         self.feat_embeddings = nn.Linear(feat_dim, config.hidden_size)
-        self.feat_mask_vec = nn.Parameter(torch.zeros(feat_dim))
-
-        self.target_embeddings = nn.Embedding(phn_size + 1, config.hidden_size)
-        # + 1 for [MASK] token
-        self.mask_token = phn_size
+        self.feat_mask_vec = nn.Parameter(torch.zeros(feat_dim), requires_grad=False)
 
         layer = BertLayer(config)
         self.encoder = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
@@ -180,6 +214,16 @@ class BertModel(BertPreTrainedModel):
 
         to_predict = (1 - predict_mask.squeeze()) * attention_mask  # shape: (N, T)
         loss = cpc_loss(output, input_feats, to_predict, attention_mask)
+        return loss
+
+    def finetune_loss(self, frame_feat, frame_label, lens):
+        frame_feat = get_tensor_from_array(frame_feat)
+        mask = get_attention_mask(lens, frame_feat.shape[1])
+        embedding_output = self.feat_embeddings(frame_feat)
+        outputs = self.forward(embedding_output, mask)
+        loss = nn.CrossEntropyLoss(reduction='none')(outputs, frame_label)
+        loss = masked_reduce_mean(loss, mask)
+        loss = loss.mean()
         return loss
 
     def forward(self, embedding_output, attention_mask):
