@@ -29,8 +29,9 @@ repeat: 1
 
 # Train
 batch_size: 10
-epoch: 20 # for supervised training
-step: 10000 # for unsupervised training 
+epoch: 100
+pretrain_step: 5
+finetune_step: 500
 print_step: 10
 eval_step: 20
 gen_iter: 1

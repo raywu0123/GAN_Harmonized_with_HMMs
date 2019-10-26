@@ -3,9 +3,7 @@ import sys
 import tensorflow as tf
 import numpy as np
 
-from evalution import (
-    frame_eval
-)
+from evalution import frame_eval
 from lib.discriminator import weak_discriminator
 from lib.module import (
     segment_loss,

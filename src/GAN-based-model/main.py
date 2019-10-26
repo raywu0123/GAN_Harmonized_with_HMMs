@@ -49,7 +49,7 @@ def print_training_parameter(args, config):
     if args.model_type == 'sup':
         print(f'   epoch:                  {config.epoch}')
         print(f'   learning rate(sup):     {config.sup_lr}')
-    else:
+    elif args.model_type in ['uns', 'swap_gan']:
         print(f'   repeat:                 {config.repeat}')
         print(f'   step:                   {config.step}')
         print(f'   learning rate(gen):     {config.gen_lr}')
@@ -62,6 +62,7 @@ def print_training_parameter(args, config):
         print(f'   data_dir:               {args.data_dir}')
         print(f'   save_dir:               {args.save_dir}')
         print(f'   config_path:            {args.config}')
+
     print_bar()
 
 

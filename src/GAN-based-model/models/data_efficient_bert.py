@@ -11,6 +11,7 @@ from pytorch_pretrained_bert.modeling import (
 )
 from pytorch_pretrained_bert.optimization import BertAdam
 
+from evalution import frame_eval
 from .base import ModelBase
 from lib.torch_utils import (
     get_tensor_from_array,
@@ -54,7 +55,7 @@ class DataEfficientBert(ModelBase):
             params=self.bert_model.parameters(),
             lr=3e-5,
             warmup=0.1,
-            t_total=config.step,
+            t_total=config.pretrain_step + config.finetune_step,
         )
         if torch.cuda.is_available():
             self.bert_model.cuda()
@@ -74,7 +75,7 @@ class DataEfficientBert(ModelBase):
         print('TRAINING(unsupervised)...')
         batch_size = config.batch_size * config.repeat
         logger = Logger(config.print_step)
-        print('Pretraining...')
+        print(f'Pretraining for {config.pretrain_step} steps...')
         self.pretrain(
             data_loader=data_loader,
             dev_data_loader=dev_data_loader,
@@ -82,7 +83,7 @@ class DataEfficientBert(ModelBase):
             config=config,
             logger=logger
         )
-        print('Finetuning...')
+        print(f'Finetuning for {config.finetune_step} steps...')
         self.finetune(
             data_loader=data_loader,
             dev_data_loader=dev_data_loader,
@@ -109,18 +110,6 @@ class DataEfficientBert(ModelBase):
         self.bert_model = checkpoint['state_dict']
         self.optimizer = checkpoint['optimizer']
 
-    def predict_batch(self, batch_frame_feat, batch_frame_len):
-        self.bert_model.eval()
-        with torch.no_grad():
-            predict_target_logits = self.bert_model.predict_targets_from_feats(
-                batch_frame_feat,
-                batch_frame_len,
-            )
-            frame_prob = torch.softmax(predict_target_logits, dim=-1)
-            frame_prob = frame_prob.cpu().data.numpy()
-        self.bert_model.train()
-        return frame_prob
-
     def pretrain(self, data_loader, dev_data_loader, batch_size, config, logger):
         i_step = 0
         for i_epoch in range(1, config.epoch + 1):
@@ -131,10 +120,12 @@ class DataEfficientBert(ModelBase):
                 loss.backward()
                 self.optimizer.step()
                 logger.update({'train_loss': loss.item()}, group_name='pretrain')
-                if i_step % config.eval_step:
+                if i_step % config.eval_step == 0:
                     self.pretrain_eval(dev_data_loader, batch_size, logger)
                 logger.step()
                 i_step += 1
+                if i_step == config.pretrain_step:
+                    return
 
     def pretrain_eval(self, dev_data_loader, batch_size, logger):
         self.bert_model.eval()
@@ -146,32 +137,38 @@ class DataEfficientBert(ModelBase):
         self.bert_model.train()
 
     def finetune(self, data_loader, dev_data_loader, batch_size, config, logger, aug):
-        i_step = 0
+        i_step = 1
         for i_epoch in range(1, config.epoch + 1):
             for batch in data_loader.get_batch(batch_size):
                 batch_frame_feat, batch_frame_label, batch_frame_len = \
                     batch['source'], batch['frame_label'], batch['source_length']
+
                 loss = self.bert_model.finetune_loss(batch_frame_feat, batch_frame_label, batch_frame_len)
                 loss.backward()
                 self.optimizer.step()
                 logger.update({'train_loss': loss.item()}, group_name='finetune')
-                if i_step % config.eval_step:
+                if i_step % config.eval_step == 0:
                     self.finetune_eval(dev_data_loader, batch_size, logger)
                 logger.step()
                 i_step += 1
+                if i_step == config.finetune_step:
+                    return
 
     def finetune_eval(self, dev_data_loader, batch_size, logger):
+        step_fer = frame_eval(
+            self.predict_batch,
+            dev_data_loader,
+            batch_size=batch_size,
+        )
+        logger.update({'val_fer': step_fer}, ema=False)
+
+    def predict_batch(self, batch_frame_feat, batch_frame_len):
         self.bert_model.eval()
         with torch.no_grad():
-            for batch in dev_data_loader.get_batch(batch_size):
-                batch_frame_feat, batch_frame_label, batch_frame_len = \
-                    batch['source'], batch['frame_label'], batch['source_length']
-                loss = self.bert_model.finetune_loss(batch_frame_feat, batch_frame_label, batch_frame_len)
-                logger.update({'val_loss': loss.item()}, group_name='finetune')
+            pred = self.bert_model.predict(batch_frame_feat, batch_frame_len)
+            pred = pred.cpu().data.numpy()
         self.bert_model.train()
-
-    def phn_eval(self, data_loader, batch_size, repeat):
-        pass
+        return pred
 
 
 class BertModel(BertPreTrainedModel):
@@ -191,11 +188,10 @@ class BertModel(BertPreTrainedModel):
         self.sep_size = sep_size
 
         self.feat_embeddings = nn.Linear(feat_dim, config.hidden_size)
-        self.feat_mask_vec = nn.Parameter(torch.zeros(feat_dim), requires_grad=False)
+        self.feat_mask_vec = nn.Parameter(torch.zeros(feat_dim), requires_grad=True)
 
         layer = BertLayer(config)
         self.encoder = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
-        self.dropout = nn.Dropout(p=0.5)
         self.feat_out_layer = nn.Linear(config.hidden_size, feat_dim)
         self.target_out_layer = nn.Linear(config.hidden_size, phn_size)
         self.apply(self.init_bert_weights)
@@ -217,14 +213,22 @@ class BertModel(BertPreTrainedModel):
         return loss
 
     def finetune_loss(self, frame_feat, frame_label, lens):
+        outputs = self.predict(frame_feat, lens)
+        outputs = outputs.transpose(1, 2)
+        frame_label = get_tensor_from_array(frame_label).long()
+        loss = nn.CrossEntropyLoss(reduction='none')(outputs, frame_label)
+        mask = get_attention_mask(lens, frame_feat.shape[1])
+        loss = masked_reduce_mean(loss, mask)
+        loss = loss.mean()
+        return loss
+
+    def predict(self, frame_feat, lens):
         frame_feat = get_tensor_from_array(frame_feat)
         mask = get_attention_mask(lens, frame_feat.shape[1])
         embedding_output = self.feat_embeddings(frame_feat)
         outputs = self.forward(embedding_output, mask)
-        loss = nn.CrossEntropyLoss(reduction='none')(outputs, frame_label)
-        loss = masked_reduce_mean(loss, mask)
-        loss = loss.mean()
-        return loss
+        outputs = self.target_out_layer(outputs)
+        return outputs
 
     def forward(self, embedding_output, attention_mask):
         if attention_mask is None:
@@ -237,5 +241,4 @@ class BertModel(BertPreTrainedModel):
         x = embedding_output
         for layer in self.encoder:
             x = layer(x, extended_attention_mask)
-            x = self.dropout(x)
         return x
