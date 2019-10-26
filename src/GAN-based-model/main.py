@@ -67,7 +67,7 @@ def print_training_parameter(args, config):
 
 def main(args, config):
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_id
+    # os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_id
 
     train_bnd_path = f'{args.data_dir}/timit_for_GAN/audio/timit-train-{args.bnd_type}{args.iteration}-bnd.pkl'
     phn_map_path = f'{args.data_dir}/phones.60-48-39.map.txt'

@@ -26,7 +26,7 @@ from callbacks import Logger
 class SwapGANModel(ModelBase):
     description = "SWAPGAN MODEL"
 
-    def __init__(self, config, wgan=False):
+    def __init__(self, config, wgan=True):
         self.config = config
         self.wgan = wgan
 
@@ -181,13 +181,10 @@ class Generator(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense_in = nn.Linear(config.feat_dim, config.gen_hidden_size)
-        self.hidden = nn.Linear(config.gen_hidden_size, config.gen_hidden_size)
         self.dense_out = nn.Linear(config.gen_hidden_size, config.phn_size)
 
     def forward(self, x, mask):
         x = self.dense_in(x)
-        x = torch.relu(x)
-        x = self.hidden(x)
         x = torch.relu(x)
         logits = self.dense_out(x)
         logits = logits * mask.unsqueeze(2)

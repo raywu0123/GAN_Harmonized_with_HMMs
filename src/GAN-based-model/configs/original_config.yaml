@@ -31,8 +31,8 @@ repeat: 6
 batch_size: 50
 epoch: 2000 # for supervised training 
 step: 10000 # for unsupervised training 
-print_step: 100
-eval_step: 200
+print_step: 10
+eval_step: 20
 gen_iter: 1
 dis_iter: 3
 gen_lr: 0.001
