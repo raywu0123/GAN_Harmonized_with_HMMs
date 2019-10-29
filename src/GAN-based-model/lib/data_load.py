@@ -1,5 +1,6 @@
 import _pickle as pk
 import sys
+import math
 
 import numpy as np
 import yaml
@@ -53,7 +54,8 @@ class DataLoader:
         meta = self.load_pickle(meta_path)['prefix']
         assert (len(feat) == len(phn) == len(orc_bnd))
 
-        self.data_length = len(feat) if data_length is None else data_length
+        self.raw_data_length = len(feat) if data_length is None else data_length
+        self.data_length = self.raw_data_length
         self.process_feat(feat[:self.data_length])
         self.process_label(orc_bnd[:self.data_length], phn[:self.data_length], meta[:self.data_length])
 
@@ -298,3 +300,8 @@ class DataLoader:
                 'text_type_label': batch_text_type_label,
                 'sentence_label': batch_sentence_label,
             }
+
+    def set_use_ratio(self, use_ratio=1.0, verbose=False):
+        self.data_length = math.ceil(self.raw_data_length * use_ratio)
+        if verbose:
+            print(f'Using data_length: {self.data_length}.')

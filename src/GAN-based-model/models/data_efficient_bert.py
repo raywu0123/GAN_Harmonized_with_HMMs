@@ -21,6 +21,7 @@ from lib.torch_utils import (
 from lib.torch_bert_utils import (
     get_attention_mask,
     get_mlm_masks,
+    PositionalEncoding,
 )
 from callbacks import Logger
 
@@ -53,7 +54,7 @@ class DataEfficientBert(ModelBase):
         )
         self.optimizer = BertAdam(
             params=self.bert_model.parameters(),
-            lr=3e-5,
+            lr=config.sup_lr,
             warmup=0.1,
             t_total=config.pretrain_step + config.finetune_step,
         )
@@ -84,6 +85,7 @@ class DataEfficientBert(ModelBase):
             logger=logger
         )
         print(f'Finetuning for {config.finetune_step} steps...')
+        data_loader.set_use_ratio(use_ratio=config.finetune_ratio, verbose=True)
         self.finetune(
             data_loader=data_loader,
             dev_data_loader=dev_data_loader,
@@ -142,7 +144,7 @@ class DataEfficientBert(ModelBase):
             for batch in data_loader.get_batch(batch_size):
                 batch_frame_feat, batch_frame_label, batch_frame_len = \
                     batch['source'], batch['frame_label'], batch['source_length']
-
+                self.optimizer.zero_grad()
                 loss = self.bert_model.finetune_loss(batch_frame_feat, batch_frame_label, batch_frame_len)
                 loss.backward()
                 self.optimizer.step()
@@ -189,7 +191,9 @@ class BertModel(BertPreTrainedModel):
 
         self.feat_embeddings = nn.Linear(feat_dim, config.hidden_size)
         self.feat_mask_vec = nn.Parameter(torch.zeros(feat_dim), requires_grad=True)
+        self.positional_encoding = PositionalEncoding(config.hidden_size)
 
+        self.model = BertModel
         layer = BertLayer(config)
         self.encoder = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
         self.feat_out_layer = nn.Linear(config.hidden_size, feat_dim)
@@ -204,8 +208,9 @@ class BertModel(BertPreTrainedModel):
         masked_input_feats = input_mask * input_feats + (1 - input_mask) * self.feat_mask_vec
         masked_input_feats *= attention_mask.unsqueeze(2)  # taking care of the paddings
 
-        embedding_output = self.feat_embeddings(masked_input_feats)
-        output = self.forward(embedding_output, attention_mask)
+        x = self.feat_embeddings(masked_input_feats)
+        x = self.positional_encoding(x)
+        output = self.forward(x, attention_mask)
         output = self.feat_out_layer(output)
 
         to_predict = (1 - predict_mask.squeeze()) * attention_mask  # shape: (N, T)
@@ -225,8 +230,9 @@ class BertModel(BertPreTrainedModel):
     def predict(self, frame_feat, lens):
         frame_feat = get_tensor_from_array(frame_feat)
         mask = get_attention_mask(lens, frame_feat.shape[1])
-        embedding_output = self.feat_embeddings(frame_feat)
-        outputs = self.forward(embedding_output, mask)
+        x = self.feat_embeddings(frame_feat)
+        x = self.positional_encoding(x)
+        outputs = self.forward(x, mask)
         outputs = self.target_out_layer(outputs)
         return outputs
 

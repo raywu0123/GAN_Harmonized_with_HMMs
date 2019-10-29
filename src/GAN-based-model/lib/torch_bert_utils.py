@@ -1,4 +1,7 @@
+import math
+
 import torch
+from torch import nn
 import numpy as np
 
 from .torch_utils import get_tensor_from_array
@@ -38,3 +41,26 @@ def get_mlm_masks(inp: torch.Tensor, mask_prob, mask_but_no_prob):
     temp_mask = get_seq_mask(inp, mask_but_no_prob)
     input_mask = 1 - (1 - predict_mask) * temp_mask  # fewer 0s
     return input_mask, predict_mask
+
+
+class PositionalEncoding(nn.Module):
+    """Implement the PE function."""
+
+    def __init__(self, emb_size, dropout=0., max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        self.dropout = nn.Dropout(p=dropout)
+
+        # Compute the positional encodings once in log space.
+        pe = torch.zeros(max_len, emb_size, dtype=torch.float32)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(
+            torch.arange(0, emb_size, 2).float() * -(math.log(10000.0) / emb_size)
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)[:, :pe[:, 0::2].shape[1]]
+        pe[:, 1::2] = torch.cos(position * div_term)[:, :pe[:, 1::2].shape[1]]
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        x = x.float() + self.pe[:, :x.size(1)]
+        return self.dropout(x)

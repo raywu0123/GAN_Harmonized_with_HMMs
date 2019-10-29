@@ -1,13 +1,13 @@
 import sys
 import os
-import copy
 
 import torch
 from torch import nn
 from pytorch_pretrained_bert.modeling import (
     BertPreTrainedModel,
     BertConfig,
-    BertLayer,
+    BertModel,
+    BertEmbeddings,
 )
 from pytorch_pretrained_bert.optimization import BertAdam
 from callbacks import Logger
@@ -47,12 +47,14 @@ class UnsBertModel(ModelBase):
             num_attention_heads=12,
             intermediate_size=3072,
         )
-
-        self.bert_model = BertModel(
+        self.pretrained_bert = BertModel.from_pretrained('bert-base-cased')
+        self.bert_model = MyBertModel(
             bert_config,
             config.feat_dim,
             config.phn_size,
             (config.batch_size * config.repeat) // 2,
+            pretrained_embeddings=self.pretrained_bert.embeddings,
+            pretrained_encoder=self.pretrained_bert.encoder,
         )
         self.optimizer = BertAdam(
             params=self.bert_model.parameters(),
@@ -180,7 +182,7 @@ class UnsBertModel(ModelBase):
         return err, sample_labels, sample_preds
 
 
-class BertModel(BertPreTrainedModel):
+class MyBertModel(BertPreTrainedModel):
 
     def __init__(
         self,
@@ -188,24 +190,19 @@ class BertModel(BertPreTrainedModel):
         feat_dim,
         phn_size,
         sep_size,
+        pretrained_embeddings,
+        pretrained_encoder,
         mask_prob=0.15,
         mask_but_no_prob=0.1,
         translate_layer_idx=-1,
         update_ratio=0.99,
     ):
-        super(BertModel, self).__init__(config)
+        super(MyBertModel, self).__init__(config)
         self.mask_prob = mask_prob
         self.mask_but_no_prob = mask_but_no_prob
         self.translate_layer_idx = translate_layer_idx
         self.update_ratio = update_ratio
         self.sep_size = sep_size
-
-        self.feat_embeddings = nn.Linear(feat_dim, config.hidden_size)
-        self.feat_mask_vec = nn.Parameter(torch.zeros(feat_dim))
-
-        self.target_embeddings = nn.Embedding(phn_size + 1, config.hidden_size)
-        # + 1 for [MASK] token
-        self.mask_token = phn_size
 
         self.translation_dense = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.shadow_feat_inner = torch.zeros(config.hidden_size)
@@ -214,56 +211,45 @@ class BertModel(BertPreTrainedModel):
             self.shadow_feat_inner = self.shadow_feat_inner.cuda()
             self.shadow_target_inner = self.shadow_target_inner.cuda()
 
-        layer = BertLayer(config)
-        self.encoder = nn.ModuleList([copy.deepcopy(layer) for _ in range(config.num_hidden_layers)])
-        self.dropout = nn.Dropout(p=0.5)
+        self.target_embeddings = BertEmbeddings(config)
         self.feat_out_layer = nn.Linear(config.hidden_size, feat_dim)
         self.target_out_layer = nn.Linear(config.hidden_size, phn_size)
         self.apply(self.init_bert_weights)
 
-    def predict_feats(self, input_feats, seq_lens, repeats):
-        input_feats = get_tensor_from_array(input_feats)
-        repeats = get_tensor_from_array(repeats)
-        attention_mask = get_attention_mask(seq_lens, input_feats.shape[1])
-        input_mask, predict_mask = get_mlm_masks(input_feats, self.mask_prob, self.mask_but_no_prob)
+        self.pretrained_embeddings = pretrained_embeddings
+        self.encoder = pretrained_encoder
+        self.cls_token, self.mask_token, self.sep_token = 102, 103, 104
 
-        masked_input_feats = input_mask * input_feats + (1 - input_mask) * self.feat_mask_vec
-        masked_input_feats *= attention_mask.unsqueeze(2)  # taking care of the paddings
-
-        embedding_output = self.feat_embeddings(masked_input_feats)
+    def predict_feats(self, feats, seq_lens, repeats):
+        feats = get_tensor_from_array(feats)
+        feats, embedding_output, attention_mask, predict_mask = self.embed_feats(feats, seq_lens, mask_lm=True)
         feat_inner = self.forward(embedding_output, attention_mask, end_layer_idx=self.translate_layer_idx)
         output = self.forward(feat_inner, attention_mask, start_layer_idx=self.translate_layer_idx)
         output = self.feat_out_layer(output)
 
         to_predict = (1 - predict_mask.squeeze()) * attention_mask  # shape: (N, T)
-        loss = cpc_loss(output, input_feats, to_predict, attention_mask)
+        loss = cpc_loss(output, feats, to_predict, attention_mask)
 
         translation_inner = self.translate(feat_inner)
         translated_logits = self.forward(translation_inner, attention_mask, start_layer_idx=self.translate_layer_idx)
         translated_logits = self.target_out_layer(translated_logits)
 
+        repeats = get_tensor_from_array(repeats)
         intra_s_loss = intra_segment_loss(translated_logits, repeats, attention_mask, self.sep_size)
         inter_s_loss = inter_segment_loss(translated_logits, attention_mask)
 
         self.update_shadow_variable(self.shadow_feat_inner, feat_inner, attention_mask)
         return loss, intra_s_loss, inter_s_loss
 
-    def predict_targets(self, input_targets, seq_lens):
-        input_targets = get_tensor_from_array(input_targets)
-        attention_mask = get_attention_mask(seq_lens, input_targets.shape[1])
-
-        input_mask, predict_mask = get_mlm_masks(input_targets, self.mask_prob, self.mask_but_no_prob)
-        masked_input_targets = input_targets * input_mask + self.mask_token * (1 - input_mask)
-        masked_input_targets *= attention_mask
-        masked_input_targets = masked_input_targets.long()
-
-        embedding_output = self.target_embeddings(masked_input_targets)
+    def predict_targets(self, target_ids, seq_lens):
+        target_ids = get_tensor_from_array(target_ids)
+        target_ids, embedding_output, attention_mask, predict_mask = self.embed_target(target_ids, seq_lens)
         target_inner = self.forward(embedding_output, attention_mask, end_layer_idx=self.translate_layer_idx)
         output = self.forward(target_inner, attention_mask, start_layer_idx=self.translate_layer_idx)
         output = self.target_out_layer(output).transpose(1, 2)
         loss_fn = nn.CrossEntropyLoss(reduction='none')
+        loss = loss_fn(output, target_ids.long())  # shape: (N, T)
         to_predict = (1 - predict_mask) * attention_mask  # shape: (N, T)
-        loss = loss_fn(output, input_targets.long())  # shape: (N, T)
         loss = torch.mean(masked_reduce_mean(loss, to_predict))
 
         self.update_shadow_variable(self.shadow_target_inner, target_inner, attention_mask)
@@ -272,17 +258,16 @@ class BertModel(BertPreTrainedModel):
     def predict_targets_from_feats(
             self,
             feats, feat_lens,
-            target_idx, target_lens,
+            target_ids, target_lens,
     ):
-        feats = get_tensor_from_array(feats)
-        feat_attention_mask = get_attention_mask(feat_lens, feats.shape[1])
-        feat_embedding = self.feat_embeddings(feats)
+        feats, feat_embedding, feat_attention_mask, _ = self.embed_feats(feats, feat_lens, mask_lm=False)
+        feats, feat_embedding, feat_lens, feat_attention_mask = self.wrap_seqs_with_tokens(
+            feats, feat_embedding, feat_attention_mask,
+        )
         feat_inner = self.forward(feat_embedding, feat_attention_mask, end_layer_idx=self.translate_layer_idx)
         self.update_shadow_variable(self.shadow_feat_inner, feat_inner, feat_attention_mask)
 
-        target_idx = get_tensor_from_array(target_idx).long()
-        target_attention_mask = get_attention_mask(target_lens, target_idx.shape[1])
-        target_embedding = self.target_embeddings(target_idx)
+        target_ids, target_embedding, target_attention_mask, _ = self.embed_target(target_ids, target_lens, mask_lm=False)
         target_inner = self.forward(target_embedding, target_attention_mask, end_layer_idx=self.translate_layer_idx)
         self.update_shadow_variable(self.shadow_target_inner, target_inner, target_attention_mask)
 
@@ -313,7 +298,6 @@ class BertModel(BertPreTrainedModel):
         x = embedding_output
         for layer in self.encoder[start_layer_idx:end_layer_idx]:
             x = layer(x, extended_attention_mask)
-            x = self.dropout(x)
         return x
 
     def update_shadow_variable(self, shadow_var, inner, mask):
@@ -329,3 +313,57 @@ class BertModel(BertPreTrainedModel):
         feat_inner = feat_inner + translation_vec
         feat_inner = self.translation_dense(feat_inner)
         return feat_inner
+
+    def embed_target(self, target_ids, seq_lens, mask_lm=True):
+        target_ids = get_tensor_from_array(target_ids).long()
+        attention_mask = get_attention_mask(seq_lens, target_ids.shape[1])
+        predict_mask = None
+        if mask_lm:
+            input_mask, predict_mask = get_mlm_masks(target_ids, self.mask_prob, self.mask_but_no_prob)
+
+        embedding_output = self.target_embeddings(target_ids)
+
+        if mask_lm:
+            embedding_output = self.use_pretrained_mask_embedding(embedding_output, input_mask)
+        embedding_output = self.pad_sep_embedding(embedding_output)
+        attention_mask = self.pad_front(attention_mask, 1)
+        predict_mask = self.pad_front(predict_mask, 0)
+        return target_ids, embedding_output, attention_mask, predict_mask
+
+    def embed_feats(self, feats, seq_lens, mask_lm=True):
+        feats = get_tensor_from_array(feats)
+        attention_mask = get_attention_mask(seq_lens, feats.shape[1])
+        predict_mask = None
+        if mask_lm:
+            input_mask, predict_mask = get_mlm_masks(feats, self.mask_prob, self.mask_but_no_prob)
+
+        embedding_output = self.feat_embeddings(feats)
+
+        if mask_lm:
+            embedding_output = self.use_pretrained_mask_embedding(embedding_output, input_mask)
+
+        embedding_output = self.pad_sep_embedding(embedding_output)
+        attention_mask = self.pad_front(attention_mask, 1)
+        predict_mask = self.pad_front(predict_mask, 0)
+        return feats, embedding_output, attention_mask, predict_mask
+
+    def use_pretrained_mask_embedding(self, inp, input_mask):
+        mask_embedding = self.get_pretrained_embeddings(self.mask_token)
+        inp = inp * input_mask + (1 - input_mask) * mask_embedding
+        return inp
+
+    def pad_sep_embedding(self, inp):
+        sep_embedding = self.get_pretrained_embeddings(self.sep_token)
+        sep_embeddings = sep_embedding.repeat(inp.shape[0], 1, 1)
+        inp = torch.cat([sep_embeddings, inp], dim=1)  # concat [sep] embeddings
+        return inp
+
+    def get_pretrained_embeddings(self, token):
+        return self.pretrained_embeddings(get_tensor_from_array(np.array([token])))  # shape: (1, E)
+
+    @staticmethod
+    def pad_front(tensor, value, dtype=int):
+        return torch.cat([
+            get_tensor_from_array(torch.full_like(tensor[:, :1], value, dtype=dtype)),
+            tensor,
+        ], dim=1)
