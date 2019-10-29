@@ -49,7 +49,7 @@ def cpc_loss(pred, tar, pred_mask, attention_mask):
     assert(pred.shape == tar.shape)
     pred = pred * attention_mask.unsqueeze(2)
     tar = tar * attention_mask.unsqueeze(2)
-    inner_products = torch.einsum('nte,nle->nlt', pred, tar)  # shape: (N, L, T)
+    inner_products = torch.einsum('nte,nle->nlt', [pred, tar])  # shape: (N, L, T)
     # other_sample_neg_inner_products = torch.einsum('nte,nle->nlt', pred, torch.flip(tar, dims=[0]))
     # max_logit = max(torch.max(inner_products), torch.max(other_sample_neg_inner_products))
     inner_products = inner_products - torch.max(inner_products).detach() + 80
@@ -135,6 +135,6 @@ def create_attention_mask(lens: np.array, max_len: int):
 
 
 def first_order_expand(grad, word_vecs, embeddings):
-    first_order_y = torch.einsum('nte,ve->ntv', grad, embeddings)
+    first_order_y = torch.einsum('nte,ve->ntv', [grad, embeddings])
     first_order_y -= torch.sum(grad * word_vecs, dim=-1, keepdim=True)
     return first_order_y
