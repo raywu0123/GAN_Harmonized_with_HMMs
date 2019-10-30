@@ -26,7 +26,7 @@ from lib.torch_bert_utils import (
     get_attention_mask,
 )
 from evalution import phn_eval
-
+use_cuda = torch.cuda.is_available() and False
 
 class UnsBertModel(ModelBase):
 
@@ -42,12 +42,18 @@ class UnsBertModel(ModelBase):
 
         bert_config = BertConfig(
             vocab_size_or_config_json_file=config.phn_size,
+            attention_probs_dropout_prob=0.1,
+            hidden_act="gelu",
+            hidden_dropout_prob=0.1,
             hidden_size=768,
-            num_hidden_layers=12,
-            num_attention_heads=12,
+            initializer_range=0.02,
             intermediate_size=3072,
+            max_position_embeddings=512,
+            num_attention_heads=12,
+            num_hidden_layers=12,
+            type_vocab_size=2
         )
-        self.pretrained_bert = BertModel.from_pretrained('bert-base-cased')
+        self.pretrained_bert = BertModel.from_pretrained('bert-base-uncased')
         self.bert_model = MyBertModel(
             bert_config,
             config.feat_dim,
@@ -62,7 +68,7 @@ class UnsBertModel(ModelBase):
             warmup=0.1,
             t_total=config.step,
         )
-        if torch.cuda.is_available():
+        if use_cuda:
             self.bert_model.cuda()
 
         sys.stdout.write('\b' * len(cout_word))
@@ -207,11 +213,11 @@ class MyBertModel(BertPreTrainedModel):
         self.translation_dense = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.shadow_feat_inner = torch.zeros(config.hidden_size)
         self.shadow_target_inner = torch.zeros(config.hidden_size)
-        if torch.cuda.is_available():
+        if use_cuda:
             self.shadow_feat_inner = self.shadow_feat_inner.cuda()
             self.shadow_target_inner = self.shadow_target_inner.cuda()
 
-        self.target_embeddings = BertEmbeddings(config)
+        self.target_embeddings = nn.Linear(phn_size, config.hidden_size)
         self.feat_embeddings = nn.Linear(feat_dim, config.hidden_size)
         self.feat_out_layer = nn.Linear(config.hidden_size, feat_dim)
         self.target_out_layer = nn.Linear(config.hidden_size, phn_size)
@@ -219,7 +225,7 @@ class MyBertModel(BertPreTrainedModel):
 
         self.pretrained_embeddings = pretrained_embeddings
         self.encoder = pretrained_encoder
-        self.cls_token, self.mask_token, self.sep_token = 102, 103, 104
+        self.cls_token, self.sep_token, self.mask_token = 101, 102, 103
 
     def predict_feats(self, feats, seq_lens, repeats):
         feats, embedding_output, attention_mask, predict_mask = self.embed_feats(feats, seq_lens, mask_lm=True)
@@ -319,6 +325,7 @@ class MyBertModel(BertPreTrainedModel):
             input_mask, predict_mask = get_mlm_masks(target_ids, self.mask_prob, self.mask_but_no_prob)
 
         embedding_output = self.target_embeddings(target_ids)
+        embedding_output = self.besides_word_embed(embedding_output)
 
         if mask_lm:
             input_mask = input_mask.unsqueeze(2)
@@ -329,6 +336,22 @@ class MyBertModel(BertPreTrainedModel):
         attention_mask = self.pad_front(attention_mask, 1)
         predict_mask = self.pad_front(predict_mask, 0)
         return target_ids, embedding_output, attention_mask, predict_mask
+
+    def besides_word_embed(self, words_embeddings):
+        seq_length = words_embeddings.shape[1]
+        batch_size = words_embeddings.shape[0]
+        token_type_ids = torch.zeros(batch_size, seq_length)
+        position_ids = torch.arange(seq_length, dtype=torch.long, device=token_type_ids.device)
+        position_ids = position_ids.unsqueeze(0).expand_as(token_type_ids)
+
+        # words_embeddings = self.word_embeddings(input_ids)
+        position_embeddings = self.pretrained_embeddings.position_embeddings(position_ids)
+        token_type_embeddings = self.pretrained_embeddings.token_type_embeddings(token_type_ids)
+
+        embeddings = words_embeddings + position_embeddings + token_type_embeddings
+        embeddings = self.pretrained_embeddings.LayerNorm(embeddings)
+        embeddings = self.pretrained_embeddings.dropout(embeddings)
+        return embeddings
 
     def embed_feats(self, feats, seq_lens, mask_lm=True):
         feats = get_tensor_from_array(feats)
@@ -343,7 +366,10 @@ class MyBertModel(BertPreTrainedModel):
             embedding_output = self.use_pretrained_mask_embedding(embedding_output, input_mask)
 
         feats = self.pad_front(feats, 0)
-        embedding_output = self.pad_sep_embedding(embedding_output)
+        embedding_output = self.pad_sep_embedding(embedding_output, seq_lens)
+        attention_mask = self.pad_back(attention_mask, 1)
+        predict_mask = self.pad_back(predict_mask, 0)
+        embedding_output = self.pad_cls_embedding(embedding_output)
         attention_mask = self.pad_front(attention_mask, 1)
         predict_mask = self.pad_front(predict_mask, 0)
         return feats, embedding_output, attention_mask, predict_mask
@@ -353,18 +379,32 @@ class MyBertModel(BertPreTrainedModel):
         inp = inp * input_mask + (1 - input_mask) * mask_embedding
         return inp
 
-    def pad_sep_embedding(self, inp):
+    def pad_cls_embedding(self, inp):
+        cls_embedding = self.get_pretrained_embeddings(self.cls_token)
+        cls_embeddings = cls_embedding.repeat(inp.shape[0], 1, 1)
+        inp = torch.cat([cls_embeddings, inp], dim=1)  # concat [cls] embeddings
+        return inp
+
+    def pad_sep_embedding(self, inp, seq_lens):
         sep_embedding = self.get_pretrained_embeddings(self.sep_token)
-        sep_embeddings = sep_embedding.repeat(inp.shape[0], 1, 1)
-        inp = torch.cat([sep_embeddings, inp], dim=1)  # concat [sep] embeddings
+        sep_embeddings_column = sep_embedding.repeat(inp.shape[0], 1, 1)
+        inp = torch.cat([inp, sep_embeddings_column], dim=1)  # concat [sep] embeddings
+        inp[torch.range(len(seq_lens)), seq_lens] = sep_embedding
         return inp
 
     def get_pretrained_embeddings(self, token):
-        return self.pretrained_embeddings(get_tensor_from_array(np.array([[token]])).long())  # shape: (1, E)
+        return self.pretrained_embeddings.word_embeddings(get_tensor_from_array(np.array([[token]])).long())  # shape: (1, E)
 
     @staticmethod
     def pad_front(tensor, value):
         return torch.cat([
             torch.full_like(tensor[:, :1], value),
+            tensor
+        ], dim=1)
+
+    @staticmethod
+    def pad_back(tensor, value):
+        return torch.cat([
             tensor,
+            torch.full_like(tensor[:, :1], value)
         ], dim=1)
