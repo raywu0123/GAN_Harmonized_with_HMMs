@@ -50,10 +50,10 @@ def cpc_loss(pred, tar, pred_mask, attention_mask):
     pred = pred * attention_mask.unsqueeze(2)
     tar = tar * attention_mask.unsqueeze(2)
     inner_products = torch.einsum('nte,nle->nlt', [pred, tar])  # shape: (N, L, T)
-    # other_sample_neg_inner_products = torch.einsum('nte,nle->nlt', pred, torch.flip(tar, dims=[0]))
-    # max_logit = max(torch.max(inner_products), torch.max(other_sample_neg_inner_products))
-    inner_products = inner_products - torch.max(inner_products).detach() + 80
-    # other_sample_neg_inner_products = other_sample_neg_inner_products - max_logit.detach()
+    other_sample_neg_inner_products = torch.einsum('nte,nle->nlt', [pred, torch.flip(tar, dims=[0])])
+    max_logit = max(torch.max(inner_products), torch.max(other_sample_neg_inner_products))
+    inner_products = inner_products - max_logit + 80
+    other_sample_neg_inner_products = other_sample_neg_inner_products - max_logit + 80
 
     exp_inner_products = torch.exp(inner_products)
     exp_inner_products = exp_inner_products * attention_mask.unsqueeze(2)
@@ -62,11 +62,11 @@ def cpc_loss(pred, tar, pred_mask, attention_mask):
     # shape: (N, T)
     mean_neg_exp_inner_product = \
         (sum_exp_inner_product - exp_pos_inner_product) / (torch.sum(attention_mask, dim=-1, keepdim=True) - 1 + epsilon)
-    # other_mean_neg_exp_inner_product = masked_reduce_mean(
-    #     torch.exp(other_sample_neg_inner_products),
-    #     torch.flip(attention_mask, dims=[0]),
-    # )  # shape: (N, T)
-    # mean_neg_exp_inner_product = (mean_neg_exp_inner_product + other_mean_neg_exp_inner_product) / 2.
+    other_mean_neg_exp_inner_product = masked_reduce_mean(
+        torch.exp(other_sample_neg_inner_products),
+        torch.flip(attention_mask, dims=[0]),
+    )  # shape: (N, T)
+    mean_neg_exp_inner_product = (mean_neg_exp_inner_product + other_mean_neg_exp_inner_product) / 2.
     pos_inner_products = torch.diagonal(inner_products, dim1=1, dim2=2) * attention_mask
     sample_cpc = masked_reduce_mean(
         torch.log(exp_pos_inner_product + mean_neg_exp_inner_product + epsilon) - pos_inner_products,
