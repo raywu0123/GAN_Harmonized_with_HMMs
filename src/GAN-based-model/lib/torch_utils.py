@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import numpy as np
 
-epsilon = 1e-8
+epsilon = 1e-12
 
 
 def get_tensor_from_array(arr: np.array) -> torch.Tensor:
@@ -35,41 +35,44 @@ def l2_loss(pred, tar, mask):
     return loss
 
 
-def cpc_loss(pred, tar, pred_mask, attention_mask, mode=''):
+def cpc_loss(pred, tar, pred_mask, attention_mask):
     """
     :param pred: shape: (N, T, V)
     :param tar:  shape: (N, L, V)
     :param pred_mask: shape: (N, T), ones at where to predict
     :param attention_mask: shape: (N, T), ones at non-padding timesteps
     assert T = L
+
+    cpc_loss = -log(exp_pos_inner_product / sum(exp_neg_inner_product) + exp_pos_inner_product)
+    = log((exp_pos_inner_product + sum(exp_neg_inner_product)) / exp_pos_inner_product)
     """
     assert(pred.shape == tar.shape)
-    if mode == 'same':
-        inner_products = torch.einsum('nte,nle->ntl', pred, tar)  # shape: (N, T, L)
-        exp_inner_products = torch.exp(inner_products)
-        denom = masked_reduce_mean(exp_inner_products, attention_mask)  # shape: (N, L)
-        num = torch.diagonal(inner_products, dim1=1, dim2=2)  # shape: (N, L)
-        cpc = -torch.mean(masked_reduce_mean(
-            num - torch.log(denom + epsilon),
-            pred_mask,
-        ))
-    else:
-        pos_inner_products = torch.einsum('nte,nte->nt', pred, tar)  # shape: (N, T)
-        neg_inner_products = torch.einsum('nte,nle->nlt', pred, torch.flip(tar, dims=[0]))  # shape: (N, T, L)
-        max_logit = max(torch.max(pos_inner_products).item(), torch.max(neg_inner_products).item())
-        pos_inner_products = pos_inner_products - max_logit
-        neg_inner_products = neg_inner_products - max_logit
+    pred = pred * attention_mask.unsqueeze(2)
+    tar = tar * attention_mask.unsqueeze(2)
+    inner_products = torch.einsum('nte,nle->nlt', [pred, tar])  # shape: (N, L, T)
+    other_sample_neg_inner_products = torch.einsum('nte,nle->nlt', [pred, torch.flip(tar, dims=[0])])
+    max_logit = max(torch.max(inner_products), torch.max(other_sample_neg_inner_products))
+    inner_products = inner_products - max_logit + 80
+    other_sample_neg_inner_products = other_sample_neg_inner_products - max_logit + 80
 
-        exp_pos_inner_products = torch.exp(pos_inner_products)
-        sum_exp_neg_inner_products = masked_reduce_sum(
-            torch.exp(neg_inner_products),
-            torch.flip(attention_mask, dims=[0]),
-        )  # shape: (N, T)
-
-        cpc = torch.mean(masked_reduce_mean(
-            torch.log(1 + sum_exp_neg_inner_products / (exp_pos_inner_products + epsilon)),
-            pred_mask,
-        ))
+    exp_inner_products = torch.exp(inner_products)
+    exp_inner_products = exp_inner_products * attention_mask.unsqueeze(2)
+    sum_exp_inner_product = masked_reduce_sum(exp_inner_products, attention_mask)  # shape: (N, T)
+    exp_pos_inner_product = torch.diagonal(exp_inner_products, dim1=1, dim2=2) * attention_mask
+    # shape: (N, T)
+    mean_neg_exp_inner_product = \
+        (sum_exp_inner_product - exp_pos_inner_product) / (torch.sum(attention_mask, dim=-1, keepdim=True) - 1 + epsilon)
+    other_mean_neg_exp_inner_product = masked_reduce_mean(
+        torch.exp(other_sample_neg_inner_products),
+        torch.flip(attention_mask, dims=[0]),
+    )  # shape: (N, T)
+    mean_neg_exp_inner_product = (mean_neg_exp_inner_product + other_mean_neg_exp_inner_product) / 2.
+    pos_inner_products = torch.diagonal(inner_products, dim1=1, dim2=2) * attention_mask
+    sample_cpc = masked_reduce_mean(
+        torch.log(exp_pos_inner_product + mean_neg_exp_inner_product + epsilon) - pos_inner_products,
+        pred_mask,
+    )
+    cpc = sample_cpc.mean()
     return cpc
 
 
@@ -132,6 +135,6 @@ def create_attention_mask(lens: np.array, max_len: int):
 
 
 def first_order_expand(grad, word_vecs, embeddings):
-    first_order_y = torch.einsum('nte,ve->ntv', grad, embeddings)
+    first_order_y = torch.einsum('nte,ve->ntv', [grad, embeddings])
     first_order_y -= torch.sum(grad * word_vecs, dim=-1, keepdim=True)
     return first_order_y

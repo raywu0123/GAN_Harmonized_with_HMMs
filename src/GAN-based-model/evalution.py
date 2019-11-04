@@ -57,7 +57,7 @@ def phn_eval(preds, lens, labels, phn_mapping):
         str_preds.append(' '.join(p))
 
     labels = [
-        [phn_mapping[i] for i in l] for l in labels
+        [phn_mapping[i] for i in label[:length]] for label, length in zip(labels, lens)
     ]
     labels = [
         [i for i, _ in groupby(l)] for l in labels

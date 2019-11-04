@@ -14,7 +14,7 @@ from evalution import frame_eval
 def add_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', help='')
-    parser.add_argument('--model_type', type=str, default='swap_gan', help='')
+    parser.add_argument('--model_type', type=str, default='data_efficient_bert', help='')
     parser.add_argument('--cuda_id', type=str, default='0', help='')
     parser.add_argument('--bnd_type', type=str, default='orc', help='')
     parser.add_argument('--setting', type=str, default='match', help='')
@@ -49,7 +49,7 @@ def print_training_parameter(args, config):
     if args.model_type == 'sup':
         print(f'   epoch:                  {config.epoch}')
         print(f'   learning rate(sup):     {config.sup_lr}')
-    else:
+    elif args.model_type in ['uns', 'swap_gan']:
         print(f'   repeat:                 {config.repeat}')
         print(f'   step:                   {config.step}')
         print(f'   learning rate(gen):     {config.gen_lr}')
@@ -62,12 +62,13 @@ def print_training_parameter(args, config):
         print(f'   data_dir:               {args.data_dir}')
         print(f'   save_dir:               {args.save_dir}')
         print(f'   config_path:            {args.config}')
+
     print_bar()
 
 
 def main(args, config):
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_id
+    # os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_id
 
     train_bnd_path = f'{args.data_dir}/timit_for_GAN/audio/timit-train-{args.bnd_type}{args.iteration}-bnd.pkl'
     phn_map_path = f'{args.data_dir}/phones.60-48-39.map.txt'
