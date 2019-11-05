@@ -43,7 +43,7 @@ class TestBertUtils(TestCase):
     def test_get_sep_mask(self):
         seq_lens = np.array([3, 5, 1, 0, 9, 100])
         inp = np.random.random([6, 9, 23])
-        sep_mask = get_sep_mask(inp, seq_lens)
+        sep_mask = get_sep_mask(inp, seq_lens).data.numpy()
         ans = np.array([
             [0, 0, 0, 1, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 1, 0, 0, 0],

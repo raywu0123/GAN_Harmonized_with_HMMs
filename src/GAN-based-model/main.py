@@ -14,7 +14,7 @@ from evalution import frame_eval
 def add_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument('--mode', type=str, default='train', help='')
-    parser.add_argument('--model_type', type=str, default='data_efficient_bert', help='')
+    parser.add_argument('--model_type', type=str, default='segment_gan', help='')
     parser.add_argument('--cuda_id', type=str, default='0', help='')
     parser.add_argument('--bnd_type', type=str, default='orc', help='')
     parser.add_argument('--setting', type=str, default='match', help='')

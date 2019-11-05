@@ -46,7 +46,6 @@ class Logger:
 
     def log_tensorboard(self):
         for key, val in self.values.items():
-            add_fn = None
             if isinstance(val, (int, float)):
                 add_fn = self.writer.add_scalar
             elif isinstance(val, str):

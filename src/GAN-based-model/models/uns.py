@@ -199,7 +199,7 @@ class UnsModel(ModelBase):
 
                 run_list = [self.dis_loss, self.train_dis_op]
                 dis_loss, _ = self.sess.run(run_list, feed_dict=feed_dict)
-                logger.update({'c_loss': float(dis_loss)})
+                logger.update({'c_loss': float(dis_loss)}, group_name='GAN_losses')
 
             for _ in range(config.gen_iter):
                 batch_sample_feat, batch_sample_len, batch_repeat_num, _ = data_loader.get_sample_batch(
@@ -222,14 +222,14 @@ class UnsModel(ModelBase):
                 gen_loss, seg_loss, _, sample = self.sess.run(run_list, feed_dict=feed_dict)
                 logger.update({
                     'g_loss': float(gen_loss),
-                    'seg_loss': float(seg_loss),
                     'fake_sample': array_to_string(np.argmax(sample[0], axis=-1)),
-                })
+                }, group_name='GAN_losses')
+                logger.update({'seg_loss': float(seg_loss)}, group_name='segment_losses')
 
             if step % config.eval_step == 0:
                 step_fer = frame_eval(self.predict_batch, dev_data_loader)
                 print(f'EVAL max: {max_fer:.2f} step: {step_fer:.2f}')
-                logger.update({'val_fer': step_fer}, ema=False)
+                logger.update({'fer': step_fer}, ema=False, group_name='val')
                 if step_fer < max_fer:
                     max_fer = step_fer
                     self.saver.save(self.sess, config.save_path)
