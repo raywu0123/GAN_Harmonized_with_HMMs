@@ -12,7 +12,7 @@ class AttrDict(dict):
         self.__dict__ = self
 
 
-def read_config(path):
+def read_config(path) -> AttrDict:
     return AttrDict(yaml.load(open(path, 'r'), Loader=yaml.FullLoader))
 
 

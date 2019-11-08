@@ -21,12 +21,20 @@ from lib.torch_utils import (
 from lib.utils import array_to_string
 from evalution import frame_eval
 from callbacks import Logger
+from lib.data_load import AttrDict
 
 
 class SwapGANModel(ModelBase):
+
     description = "SWAPGAN MODEL"
 
-    def __init__(self, config, wgan=True):
+    def __init__(
+            self,
+            config: AttrDict,
+            wgan=False,
+            spectral_norm=False,
+            policy_gradient=True,
+    ):
         self.config = config
         self.wgan = wgan
 
@@ -34,8 +42,13 @@ class SwapGANModel(ModelBase):
         sys.stdout.write(cout_word)
         sys.stdout.flush()
 
-        self.generator = Generator(config)
-        self.critic = Critic(config, wgan=wgan)
+        self.generator = Generator(config, policy_gradient=policy_gradient)
+        self.critic = Critic(
+            config,
+            wgan=wgan,
+            spectral_norm=spectral_norm,
+            policy_gradient=policy_gradient,
+        )
 
         self.g_opt = torch.optim.Adam(
             params=self.generator.parameters(),
@@ -179,8 +192,9 @@ class SwapGANModel(ModelBase):
 
 class Generator(nn.Module):
 
-    def __init__(self, config):
+    def __init__(self, config, policy_gradient=True):
         super().__init__()
+        self.policy_gradient = policy_gradient
         self.dense_in = nn.Linear(config.feat_dim, config.gen_hidden_size)
         self.hidden = nn.Linear(config.gen_hidden_size, config.gen_hidden_size)
         self.dense_out = nn.Linear(config.gen_hidden_size, config.phn_size)
@@ -196,19 +210,24 @@ class Generator(nn.Module):
         return logits, idx
 
     def compute_loss(self, reward, kernel, target_logits, target_idx, mask, normalize_type=0):
-        target_probs = torch.softmax(target_logits, dim=-1)  # shape: (N, T, V)
-        batch_kernel = F.embedding(input=target_idx, weight=kernel)  # shape: (N, T, V)
-        if normalize_type == 1:
-            selected_probs = torch.gather(
-                target_probs,
-                dim=-1,
-                index=target_idx.unsqueeze(2),
-            )  # shape: (N, T, 1)
-            batch_kernel /= (selected_probs + epsilon)
+        if self.policy_gradient:
+            target_logits = target_logits.transpose(1, 2)  # (N, V, T)
+            neg_likelihood = nn.CrossEntropyLoss(reduction='none')(target_logits, target_idx)
+            seq_loss = reward.detach() * neg_likelihood
         else:
-            batch_kernel /= (torch.einsum('ntv,vq->ntq', [target_probs, kernel]) + epsilon)
-        full_loss = -(batch_kernel * reward).detach() * target_probs
-        seq_loss = torch.sum(full_loss, dim=-1)  # shape: (N, T)
+            target_probs = torch.softmax(target_logits, dim=-1)  # shape: (N, T, V)
+            batch_kernel = F.embedding(input=target_idx, weight=kernel)  # shape: (N, T, V)
+            if normalize_type == 1:
+                selected_probs = torch.gather(
+                    target_probs,
+                    dim=-1,
+                    index=target_idx.unsqueeze(2),
+                )  # shape: (N, T, 1)
+                batch_kernel /= (selected_probs + epsilon)
+            else:
+                batch_kernel /= (torch.einsum('ntv,vq->ntq', target_probs, kernel) + epsilon)
+            full_loss = -(batch_kernel * reward).detach() * target_probs
+            seq_loss = torch.sum(full_loss, dim=-1)  # shape: (N, T)
         sample_loss = masked_reduce_sum(seq_loss, mask)  # shape: (N,)
         loss = torch.mean(sample_loss)
         return loss
@@ -216,35 +235,47 @@ class Generator(nn.Module):
 
 class Critic(nn.Module):
 
-    def __init__(self, config, kernel_sizes=(3, 5, 7, 9), wgan=False):
+    def __init__(
+            self,
+            config,
+            kernel_sizes=(3, 5, 7, 9),
+            wgan=False,
+            spectral_norm=True,
+            policy_gradient=True,
+    ):
         super().__init__()
         self.wgan = wgan
         self.kernel_sizes = kernel_sizes
+        self.policy_gradient = policy_gradient
         self.ema = EMA(0.9)
         self.embedding = nn.Embedding(config.phn_size, embedding_dim=config.dis_emb_size)
         self.e = None
         self.first_channels = config.dis_emb_size
+        if spectral_norm:
+            norm_fn = lambda x: nn.utils.spectral_norm(x)
+        else:
+            norm_fn = lambda x: x
         self.first_convs = nn.ModuleList([
-            nn.Conv1d(
+            norm_fn(nn.Conv1d(
                 config.dis_emb_size,
                 self.first_channels,
                 kernel_size=kernel_size,
                 padding=kernel_size // 2,
-            )
+            ))
             for kernel_size in kernel_sizes
         ])
         self.second_channels = config.dis_emb_size
         self.second_convs = nn.ModuleList([
-            nn.Conv1d(
+            norm_fn(nn.Conv1d(
                 self.first_channels * len(kernel_sizes),
                 self.second_channels,
                 kernel_size=kernel_size,
                 padding=kernel_size // 2,
-            )
+            ))
             for kernel_size in kernel_sizes
         ])
         self.activation = torch.nn.LeakyReLU()
-        self.dense = nn.Linear(config.phn_max_length * self.second_channels * len(kernel_sizes), 1)
+        self.dense = norm_fn(nn.Linear(config.phn_max_length * self.second_channels * len(kernel_sizes), 1))
 
     def forward(self, x):
         # x: (N, T)
@@ -296,7 +327,10 @@ class Critic(nn.Module):
         N = reward.shape[0]
         grad_on_emb = grad(outputs=N * mean_reward, inputs=emb_vecs)[0]  # shape: (N, T, E)
         embedding_weights = self.get_embedding_weights()  # shape: (V, E)
-        first_order_reward = first_order_expand(grad_on_emb, emb_vecs, embedding_weights)
         ema_reward = self.ema(mean_reward)
-        advantage = first_order_reward + (reward - ema_reward).view(-1, 1, 1)
+        if self.policy_gradient:
+            advantage = (reward - ema_reward).view(-1, 1, 1)
+        else:
+            first_order_reward = first_order_expand(grad_on_emb, emb_vecs, embedding_weights)
+            advantage = first_order_reward + (reward - ema_reward).view(-1, 1, 1)
         return advantage
