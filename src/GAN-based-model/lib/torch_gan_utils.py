@@ -14,12 +14,12 @@ def to_onehot(y: torch.Tensor, class_num: int):
 
 
 def compute_gradient_penalty(score: torch.Tensor, samples: torch.Tensor):
-    jac = grad(
+    gradients = grad(
         outputs=score,
         inputs=samples,
         grad_outputs=torch.ones_like(score, device=score.device),
         create_graph=True,
-        retain_graph=True,
     )[0]
-    slopes = torch.sqrt((jac ** 2).sum(-1).sum(-1))
-    return torch.mean((slopes - 1) ** 2)
+    gradients = gradients.view(gradients.shape[0], -1)
+    gradient_norms = gradients.norm(2, dim=1)
+    return torch.mean((gradient_norms - 1) ** 2)

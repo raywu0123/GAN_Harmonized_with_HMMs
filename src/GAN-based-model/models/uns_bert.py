@@ -112,14 +112,14 @@ class UnsBertModel(ModelBase):
                 'inter_s_loss': inter_s_loss.item(),
             }, group_name='segment_losses')
 
-            if step % config.eval_step == 0:
-                step_err, labels, preds = self.phn_eval(
-                    data_loader,
+            if step % config.eval_step== 0:
+                step_err, labels, preds = phn_eval(
+                    self.predict_batch,
+                    dev_data_loader,
                     batch_size=batch_size,
-                    repeat=config.repeat,
                 )
                 print(f'EVAL max: {max_err:.2f} step: {step_err:.2f}')
-                logger.update({'val_per': step_err}, ema=False)
+                logger.update({'per': step_err}, ema=False, group_name='val')
                 logger.update({
                     "LABEL": " ".join(["%3s" % str(l) for l in labels[0]]),
                     "PREDICT": " ".join(["%3s" % str(p) for p in preds[0]]),
@@ -150,35 +150,6 @@ class UnsBertModel(ModelBase):
 
     def predict_batch(self, batch_frame_feat, batch_frame_len):
         pass
-
-    def phn_eval(self, data_loader, batch_size, repeat):
-        self.bert_model.eval()
-        with torch.no_grad():
-            error_counts = []
-            lens = []
-            for _ in range(10):
-                batch_feat, batch_feat_len, _, batch_phn_label = data_loader.get_sample_batch(
-                    batch_size,
-                    repeat=repeat,
-                )
-                batch_prob = self.bert_model.predict_targets_from_feats(
-                    batch_feat,
-                    batch_feat_len,
-                )
-                batch_prob = batch_prob.cpu().data.numpy()
-                batch_pred = np.argmax(batch_prob, axis=-1)
-                error_count, label_length, sample_labels, sample_preds = phn_eval(
-                    batch_pred,
-                    batch_feat_len,
-                    batch_phn_label,
-                    data_loader.phn_mapping,
-                )
-                error_counts.append(error_count)
-                lens.append(label_length)
-
-        self.bert_model.train()
-        per = np.sum(error_counts) / np.sum(lens) * 100
-        return per, sample_labels, sample_preds
 
 
 class MyBertModel(BertPreTrainedModel):

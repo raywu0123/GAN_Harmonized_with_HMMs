@@ -46,7 +46,34 @@ def evaluate_frame_result(frame_pred, frame_label, frame_len, phn_mapping):
     return frame_num, frame_error
 
 
-def phn_eval(preds, lens, labels, phn_mapping):
+def phn_eval(
+    predict_batch_frame_fn,
+    data_loader,
+    batch_size=256,
+):
+    error_counts = []
+    lens = []
+    for batch in data_loader.get_batch(batch_size):
+        batch_feat, batch_feat_len, batch_frame_label = batch['source'], batch['source_length'], batch['frame_label']
+        batch_prob = predict_batch_frame_fn(batch_feat, batch_feat_len)
+        batch_pred = np.argmax(batch_prob, axis=-1)
+        batch_phn_label = [
+            [i for i, _ in groupby(p)]
+            for p in batch_frame_label
+        ]
+        error_count, label_length, sample_labels, sample_preds = phn_eval_util(
+            batch_pred,
+            batch_feat_len,
+            batch_phn_label,
+            data_loader.phn_mapping,
+        )
+        error_counts.append(error_count)
+        lens.append(label_length)
+    per = np.sum(error_counts) / np.sum(lens) * 100
+    return per, sample_labels, sample_preds
+
+
+def phn_eval_util(preds, lens, labels, phn_mapping):
     str_preds = []
     int_preds = []
     for pred, l in zip(preds, lens):

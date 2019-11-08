@@ -28,6 +28,7 @@ sample_var: 0.15
 repeat: 6
 
 # Train
+epoch: 200
 step: 10000
 batch_size: 50
 print_step: 100

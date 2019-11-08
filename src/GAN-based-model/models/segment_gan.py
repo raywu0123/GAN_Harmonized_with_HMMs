@@ -1,6 +1,5 @@
 import sys
 import os
-import math
 
 import torch
 from torch import nn
@@ -9,16 +8,16 @@ from torch.nn import functional as F
 from .base import ModelBase
 from lib.torch_utils import (
     get_tensor_from_array,
-    gumbel_sample,
-    create_attention_mask,
-    intra_segment_loss,
+    cpc_loss,
+    masked_reduce_mean,
 )
 from lib.torch_gan_utils import (
     to_onehot,
     compute_gradient_penalty,
 )
+from lib.torch_bert_utils import get_attention_mask
 from lib.utils import array_to_string
-from evalution import frame_eval
+from evalution import phn_eval
 from callbacks import Logger
 
 
@@ -34,10 +33,11 @@ class SegmentGANModel(ModelBase):
         sys.stdout.flush()
 
         self.generator = Generator(config)
+        self.reverse_generator = ReverseGenerator(config)
         self.critic = Critic(config)
 
         self.g_opt = torch.optim.Adam(
-            params=self.generator.parameters(),
+            params=list(self.generator.parameters()) + list(self.reverse_generator.parameters()),
             lr=config.gen_lr,
             betas=[0.5, 0.9],
         )
@@ -49,6 +49,7 @@ class SegmentGANModel(ModelBase):
 
         if torch.cuda.is_available():
             self.generator.cuda()
+            self.reverse_generator.cuda()
             self.critic.cuda()
 
         sys.stdout.write('\b' * len(cout_word))
@@ -71,100 +72,116 @@ class SegmentGANModel(ModelBase):
 
         batch_size = config.batch_size * config.repeat
         logger = Logger(print_step=config.print_step)
-        max_fer = 100.0
+        max_err = 100.0
         frame_temp = 0.9
-        for step in range(1, config.step + 1):
-            if step == 8000:
-                frame_temp = 0.8
-            if step == 12000:
-                frame_temp = 0.7
+        step = 1
+        for epoch in range(1, config.epoch + 1):
+            for batch in data_loader.get_batch(batch_size):
+                if step == 8000:
+                    frame_temp = 0.8
+                if step == 12000:
+                    frame_temp = 0.7
 
-            self.generator.eval()
-            for _ in range(config.dis_iter):
-                self.c_opt.zero_grad()
-                batch_sample_feat, batch_sample_len, batch_repeat_num, batch_phn_label = data_loader.get_sample_batch(
-                    config.batch_size,
-                    repeat=config.repeat,
-                )
-                feat_mask = create_attention_mask(batch_sample_len, config.phn_max_length).unsqueeze(2)
+                if step % (config.dis_iter + config.gen_iter) < config.dis_iter:
+                    self.generator.eval()
+                    self.critic.train()
+                    self.train_critic(batch, get_target_batch, logger, config, frame_temp)
+                else:
+                    self.critic.eval()
+                    self.generator.train()
+                    self.train_generator(batch, logger, config, frame_temp, get_target_batch)
 
-                real_target_idx, batch_target_len = get_target_batch(batch_size)
-                batch_sample_feat = get_tensor_from_array(batch_sample_feat)
-                real_target_idx = get_tensor_from_array(real_target_idx).long()
-                real_target_probs = to_onehot(real_target_idx, class_num=config.phn_size)
-                target_mask = create_attention_mask(batch_target_len, config.phn_max_length).unsqueeze(2)
-
-                fake_target_logits = self.generator(batch_sample_feat)
-                fake_target_probs = F.softmax(fake_target_logits / frame_temp, dim=-1)
-                real_score = self.critic(real_target_probs, target_mask).mean()
-                fake_score = self.critic(fake_target_probs, feat_mask).mean()
-
-                real_target_probs = (real_target_probs * target_mask)
-                fake_target_probs = (fake_target_probs * feat_mask)
-                inter_alphas = torch.empty(
-                    [fake_target_probs.shape[0], 1, 1],
-                    device=fake_target_probs.device,
-                ).uniform_()
-                inter_samples = real_target_probs + inter_alphas * (fake_target_probs.detach() - real_target_probs)
-                inter_samples = torch.tensor(inter_samples, requires_grad=True)
-                inter_score = self.critic(inter_samples).mean()
-                gradient_penalty = compute_gradient_penalty(inter_score, inter_samples)
-
-                c_loss = -real_score + fake_score + config.penalty_ratio * gradient_penalty
-                c_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 5.)
-                self.c_opt.step()
-                logger.update({
-                    'c_loss': c_loss.item(),
-                    'true_sample': array_to_string(real_target_idx[0].cpu().data.numpy()),
-                    'gradient_penalty': gradient_penalty.item(),
-                }, group_name='GAN_losses')
-
-            self.generator.train()
-            self.critic.eval()
-            for _ in range(config.gen_iter):
-                self.g_opt.zero_grad()
-                batch_sample_feat, batch_sample_len, batch_repeat_num, batch_phn_label = data_loader.get_sample_batch(
-                    config.batch_size,
-                    repeat=config.repeat,
-                )
-                batch_sample_feat = get_tensor_from_array(batch_sample_feat)
-                mask = create_attention_mask(batch_sample_len, config.phn_max_length).unsqueeze(2)
-                batch_repeat_num = get_tensor_from_array(batch_repeat_num)
-
-                fake_target_logits = self.generator(batch_sample_feat)
-                fake_target_probs = F.softmax(fake_target_logits / frame_temp, dim=-1)
-                fake_score = self.critic(fake_target_probs, mask).mean()  # shape: (N, 1)
-                g_loss = -fake_score
-
-                segment_loss = intra_segment_loss(
-                    fake_target_logits,
-                    batch_repeat_num,
-                    mask.squeeze(),
-                    sep_size=(config.batch_size * config.repeat) // 2,
-                )
-                total_loss = g_loss + config.seg_loss_ratio * segment_loss
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 5.)
-                self.g_opt.step()
-
-                fake_sample = torch.argmax(fake_target_probs[0], dim=-1) * mask[0].squeeze().long()
-                logger.update({
-                    'g_loss': g_loss.item(),
-                    'fake_sample': array_to_string(fake_sample.cpu().data.numpy()),
-                }, group_name='GAN_losses')
-                logger.update({'seg_loss': segment_loss.item()}, group_name='segment_losses')
-
-            self.critic.train()
-            if step % config.eval_step == 0:
-                step_fer = frame_eval(self.predict_batch, dev_data_loader)
-                logger.update({'fer': step_fer}, ema=False, group_name='val')
-                print(f'EVAL max: {max_fer:.2f} step: {step_fer:.2f}')
-                if step_fer < max_fer:
-                    max_fer = step_fer
-            logger.step()
-
+                if step % config.eval_step == 0:
+                    step_err, labels, preds = phn_eval(
+                        self.predict_batch,
+                        dev_data_loader,
+                        batch_size=batch_size,
+                    )
+                    print(f'EVAL max: {max_err:.2f} step: {step_err:.2f}')
+                    logger.update({'per': step_err}, ema=False, group_name='val')
+                    logger.update({
+                        "LABEL  ": " ".join(["%3s" % str(l) for l in labels[0]]),
+                        "PREDICT": " ".join(["%3s" % str(p) for p in preds[0]]),
+                    }, ema=False)
+                    if step_err < max_err:
+                        max_err = step_err
+                        self.save(config.save_path)
+                logger.step()
+                step += 1
         print('=' * 80)
+
+    def train_critic(self, batch, get_target_batch, logger, config, frame_temp):
+        self.c_opt.zero_grad()
+        feats, feat_lens = batch['source'], batch['source_length']
+        batch_feats = get_tensor_from_array(feats)
+        batch_size = len(feats)
+        real_target_idx, batch_target_len = get_target_batch(batch_size)
+        real_target_idx = get_tensor_from_array(real_target_idx).long()
+        real_target_probs = to_onehot(real_target_idx, class_num=config.phn_size)
+
+        fake_target_logits = self.generator(batch_feats).detach()
+        fake_target_probs = F.softmax(fake_target_logits / frame_temp, dim=-1)
+        real_score = self.critic(real_target_probs).mean()
+        fake_score = self.critic(fake_target_probs).mean()
+
+        inter_alphas = torch.empty(
+            [fake_target_probs.shape[0], 1, 1],
+            device=fake_target_probs.device,
+        ).uniform_()
+        inter_samples = real_target_probs + inter_alphas * (fake_target_probs.detach() - real_target_probs)
+        inter_samples = torch.tensor(inter_samples, requires_grad=True)
+        inter_score = self.critic(inter_samples)  # shape: (N, 1)
+        gradient_penalty = compute_gradient_penalty(inter_score, inter_samples)
+
+        c_loss = -real_score + fake_score + config.penalty_ratio * gradient_penalty
+        c_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 5.)
+        self.c_opt.step()
+        logger.update({
+            'c_loss': c_loss.item(),
+            'true_sample': array_to_string(real_target_idx[0].cpu().data.numpy()),
+            'gradient_penalty': gradient_penalty.item(),
+        }, group_name='GAN_losses')
+
+    def train_generator(self, batch, logger, config, frame_temp, get_target_batch):
+        self.g_opt.zero_grad()
+        feats, feat_lens = batch['source'], batch['source_length']
+        batch_feats = get_tensor_from_array(feats)
+        mask = get_attention_mask(feat_lens, max_len=config.feat_max_length)
+        fake_target_logits = self.generator(batch_feats)
+
+        fake_target_probs = F.softmax(fake_target_logits / frame_temp, dim=-1)
+        fake_score = self.critic(fake_target_probs).mean()  # shape: (N, 1)
+
+        reverse_feats = self.reverse_generator(fake_target_probs)
+        feat_recon_loss = cpc_loss(reverse_feats, batch_feats, mask, mask)
+        real_target_idx, batch_target_len = get_target_batch(batch_size=len(feats))
+        target_mask = get_attention_mask(batch_target_len, max_len=config.phn_max_length)
+
+        real_target_idx = get_tensor_from_array(real_target_idx).long()
+        real_target_probs = to_onehot(real_target_idx, class_num=config.phn_size)
+        recon_target_logits = self.generator(self.reverse_generator(real_target_probs).detach()).transpose(1, 2)
+        target_recon_loss = nn.CrossEntropyLoss(reduction='none')(recon_target_logits, real_target_idx)
+        target_recon_loss = masked_reduce_mean(target_recon_loss, target_mask).mean()
+
+        g_loss = -fake_score + feat_recon_loss + target_recon_loss
+        total_loss = g_loss
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.generator.parameters()) + list(self.reverse_generator.parameters()),
+            5.
+        )
+        self.g_opt.step()
+
+        fake_sample = torch.argmax(fake_target_probs[0], dim=-1).long()
+        logger.update({
+            'g_loss': g_loss.item(),
+            'fake_sample': array_to_string(fake_sample.cpu().data.numpy()),
+        }, group_name='GAN_losses')
+        logger.update({
+            'feat_recon_loss': feat_recon_loss.item(),
+            'target_recon_loss': target_recon_loss.item(),
+        }, group_name='recon_losses')
 
     def save(self, save_path):
         if not os.path.exists(save_path):
@@ -179,11 +196,11 @@ class SegmentGANModel(ModelBase):
         # TODO
         pass
 
-    def predict_batch(self, batch_frame_feat, batch_frame_len):
+    def predict_batch(self, batch_feat, batch_len):
         self.generator.eval()
         with torch.no_grad():
-            batch_frame_feat = get_tensor_from_array(batch_frame_feat)
-            batch_frame_logits = self.generator(batch_frame_feat)
+            batch_feat = get_tensor_from_array(batch_feat)
+            batch_frame_logits = self.generator(batch_feat)
             batch_frame_prob = torch.softmax(batch_frame_logits, dim=-1)
 
         batch_frame_prob = batch_frame_prob.cpu().data.numpy()
@@ -197,12 +214,52 @@ class Generator(nn.Module):
         super().__init__()
         self.dense_in = nn.Linear(config.feat_dim, config.gen_hidden_size)
         self.dense_out = nn.Linear(config.gen_hidden_size, config.phn_size)
+        self.cnn = nn.Sequential(
+            nn.ReLU(),
+            nn.Conv1d(in_channels=config.gen_hidden_size, out_channels=config.gen_hidden_size, kernel_size=9, stride=2),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=config.gen_hidden_size, out_channels=config.gen_hidden_size, kernel_size=9, stride=2),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=config.gen_hidden_size, out_channels=config.gen_hidden_size, kernel_size=9, stride=2),
+        )
+        self.phn_max_length = config.phn_max_length
 
-    def forward(self, x) -> torch.Tensor:
+    def forward(self, x, mask=None) -> torch.Tensor:
         x = self.dense_in(x)
-        x = torch.relu(x)
+        x = x.transpose(1, 2)
+        x = self.cnn(x)
+        x = F.interpolate(x, [self.phn_max_length])
+        x = x.transpose(1, 2)
+        x = F.relu(x)
         logits = self.dense_out(x)
         return logits
+
+
+class ReverseGenerator(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.dense_in = nn.Linear(config.phn_size, config.gen_hidden_size)
+        self.dense_out = nn.Linear(config.gen_hidden_size, config.feat_dim)
+        self.feat_max_length = config.feat_max_length
+        self.dcnn = nn.Sequential(
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=config.gen_hidden_size, out_channels=config.gen_hidden_size, kernel_size=9, stride=2),
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=config.gen_hidden_size, out_channels=config.gen_hidden_size, kernel_size=9, stride=2),
+            nn.ReLU(),
+            nn.ConvTranspose1d(in_channels=config.gen_hidden_size, out_channels=config.gen_hidden_size, kernel_size=9, stride=2)
+        )
+
+    def forward(self, x):
+        x = self.dense_in(x)
+        x = x.transpose(1, 2)
+        x = self.dcnn(x)
+        x = F.interpolate(x, size=[self.feat_max_length], mode='linear')
+        x = x.transpose(1, 2)
+        x = F.relu(x)
+        x = self.dense_out(x)
+        return x
 
 
 class Critic(nn.Module):
