@@ -49,15 +49,17 @@ class DataLoader:
         self.read_phn_map(phn_map_path)
 
         feat = self.load_pickle(feat_path)
-        phn = self.load_pickle(phn_path)
-        orc_bnd = self.load_pickle(orc_bnd_path)
-        meta = self.load_pickle(meta_path)['prefix']
-        assert (len(feat) == len(phn) == len(orc_bnd))
-
         self.raw_data_length = len(feat) if data_length is None else data_length
         self.data_length = self.raw_data_length
-        self.process_feat(feat[:self.data_length])
-        self.process_label(orc_bnd[:self.data_length], phn[:self.data_length], meta[:self.data_length])
+
+        feat = feat[:self.data_length]
+        phn = self.load_pickle(phn_path)[:self.data_length]
+        orc_bnd = self.load_pickle(orc_bnd_path)[:self.data_length]
+        meta = self.load_pickle(meta_path)['prefix'][:self.data_length]
+        assert (len(feat) == len(phn) == len(orc_bnd))
+
+        self.process_feat(feat)
+        self.process_label(orc_bnd, phn, meta)
 
         if train_bnd_path is not None:
             self.process_train_bnd(train_bnd_path)
@@ -282,6 +284,7 @@ class DataLoader:
 
         for i in range(self.batch_number):
             batch_source = self.source_data[self.pointer:self.pointer + batch_size]  # framewise feature
+            batch_source_bnd = self.orc_bnd[self.pointer:self.pointer + batch_size]
             batch_frame_label = self.frame_label[self.pointer:self.pointer + batch_size]  # framewise phoneme label
             batch_source_length = self.source_data_length[self.pointer:self.pointer + batch_size]  # sequence length
             batch_dialect_label = self.dialect_label[self.pointer:self.pointer + batch_size]
@@ -292,6 +295,7 @@ class DataLoader:
             self.update_pointer(batch_size)
             yield {
                 'source': batch_source,
+                'source_bnd': batch_source_bnd,
                 'frame_label': batch_frame_label,
                 'source_length': batch_source_length,
                 'dialect_label': batch_dialect_label,

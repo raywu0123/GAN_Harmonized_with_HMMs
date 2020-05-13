@@ -19,6 +19,7 @@ dis_hidden_2_size: 256
 seg_loss_ratio: 0.5
 penalty_ratio: 10
 frame_temp: 0.9
+n_segment_map_layers: 30
 
 # Data loader
 phn_max_length: 75

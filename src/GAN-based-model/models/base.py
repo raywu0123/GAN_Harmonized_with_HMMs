@@ -15,10 +15,8 @@ class ModelBase(ABC):
     ):
         pass
 
-    @abstractmethod
     def restore(self, save_dir):
         pass
 
-    @abstractmethod
     def predict_batch(self, batch_frame_feat, batch_frame_len):
         pass
