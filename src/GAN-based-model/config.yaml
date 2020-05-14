@@ -16,6 +16,7 @@ gen_hidden_size: 512
 dis_emb_size: 256
 dis_hidden_1_size: 256
 dis_hidden_2_size: 256
+recon_loss_ratio: 1.
 seg_loss_ratio: 0.5
 penalty_ratio: 10
 frame_temp: 0.9

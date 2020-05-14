@@ -4,9 +4,8 @@ import numpy as np
 import torch
 
 from .base import ModelBase
-from .segment_gan import SegmentMapGenerator, SegmentMapper
+from .segment_gan import SegmentMapGenerator
 from lib.torch_utils import get_tensor_from_array, masked_reduce_mean
-from lib.torch_bert_utils import get_attention_mask
 from callbacks import Logger
 
 
@@ -21,8 +20,7 @@ class SupervisedSegmentModel(ModelBase):
         sys.stdout.write(cout_word)
         sys.stdout.flush()
 
-        self.segment_mapper = SegmentMapper(config)
-        self.segment_map_generator = SegmentMapGenerator(config, self.segment_mapper.n_param)
+        self.segment_map_generator = SegmentMapGenerator(config, self.config.phn_max_length)
 
         self.opt = torch.optim.Adam(
             params=self.segment_map_generator.parameters(),
@@ -67,7 +65,7 @@ class SupervisedSegmentModel(ModelBase):
         feats, orc_bnd, source_lens = batch['source'], batch['source_bnd'], batch['source_length']
         batch_feats = get_tensor_from_array(feats)
 
-        processed = self.process_orc_bnd(orc_bnd, self.segment_mapper.n_param, self.config.feat_max_length)
+        processed = self.process_orc_bnd(orc_bnd, self.config.phn_max_length, self.config.feat_max_length)
         dist_to_centers, widths, feat_mask = processed['dis_to_centers'], processed['widths'], processed['feat_mask']
         centers_label, phn_mask = processed['centers'], processed['phn_mask']
 
@@ -128,7 +126,7 @@ class SupervisedSegmentModel(ModelBase):
                 feats, orc_bnd, source_lens = batch['source'], batch['source_bnd'], batch['source_length']
                 batch_feats = get_tensor_from_array(feats)
 
-                processed = self.process_orc_bnd(orc_bnd, self.segment_mapper.n_param, self.config.feat_max_length)
+                processed = self.process_orc_bnd(orc_bnd, self.config.phn_max_length, self.config.feat_max_length)
                 dist_to_centers, widths, feat_mask = processed['dis_to_centers'], processed['widths'], processed[
                     'feat_mask']
                 centers_label, phn_mask = processed['centers'], processed['phn_mask']

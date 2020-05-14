@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 
 import numpy as np
 from scipy.stats.stats import pearsonr
@@ -32,12 +33,12 @@ class SegmentGANModel(ModelBase):
         sys.stdout.flush()
 
         self.generator = Generator(config)
-        self.segment_mapper = SegmentMapper(config)
-        self.segment_map_generator = SegmentMapGenerator(config, self.segment_mapper.n_param)
+        self.segment_map_generator = SegmentMapGenerator(config, self.config.phn_max_length)
+        self.reconstruction_net = ReconstructionNet(config)
         self.critic = Critic(config)
 
         self.g_opt = torch.optim.Adam(
-            params=list(self.generator.parameters()) + list(self.segment_map_generator.parameters()),
+            params=list(self.generator.parameters()) + list(self.segment_map_generator.parameters()) + list(self.reconstruction_net.parameters()),
             lr=config.gen_lr,
             betas=[0.5, 0.9],
         )
@@ -50,7 +51,7 @@ class SegmentGANModel(ModelBase):
         if torch.cuda.is_available():
             self.generator.cuda()
             self.segment_map_generator.cuda()
-            self.segment_mapper.cuda()
+            self.reconstruction_net.cuda()
             self.critic.cuda()
 
         sys.stdout.write('\b' * len(cout_word))
@@ -86,7 +87,7 @@ class SegmentGANModel(ModelBase):
                 if step % (config.dis_iter + config.gen_iter) < config.dis_iter:
                     self.generator.eval()
                     self.critic.train()
-                    self.train_critic(batch, get_target_batch, logger, config, frame_temp)
+                    # self.train_critic(batch, get_target_batch, logger, config, frame_temp)
                 else:
                     self.critic.eval()
                     self.generator.train()
@@ -108,8 +109,7 @@ class SegmentGANModel(ModelBase):
         feat_mask = get_attention_mask(feat_lens, self.config.feat_max_length)
         batch_feats, feat_lens = get_tensor_from_array(feats), get_tensor_from_array(feat_lens)
 
-        segment_map_params = self.segment_map_generator(batch_feats, feat_mask)
-        feat_indices = self.segment_mapper.get_feat_indices(segment_map_params)  # (batch_size, config.phn_max_length)
+        feat_indices = self.segment_map_generator(batch_feats, feat_mask)
         selected_feats, mask = self.get_selected_feats(batch_feats, feat_lens, feat_indices)  # (batch_size, config.phn_max_length)
         fake_target_logits = self.generator(selected_feats)
 
@@ -117,9 +117,13 @@ class SegmentGANModel(ModelBase):
         noisy_selected_feats, _ = self.get_selected_feats(batch_feats, feat_lens, noisy_feat_indices)
         noisy_fake_target_logits = self.generator(noisy_selected_feats)
         return {
+            "selected_feats": selected_feats,
+            "selected_indices": feat_indices,
             "fake_target_logits": fake_target_logits,
             "noisy_fake_target_logits": noisy_fake_target_logits,
-            "mask": mask,
+            "phn_mask": mask,
+            'feats': batch_feats,
+            "feat_mask": feat_mask,
         }
 
     @staticmethod
@@ -143,9 +147,9 @@ class SegmentGANModel(ModelBase):
         self.c_opt.zero_grad()
 
         gen = self.generate(batch)
-        fake_target_logits, mask = gen['fake_target_logits'], gen['mask']
+        fake_target_logits, phn_mask = gen['fake_target_logits'], gen['phn_mask']
         fake_target_probs = F.softmax(fake_target_logits / frame_temp, dim=-1)
-        fake_score = self.critic(fake_target_probs, mask).mean()
+        fake_score = self.critic(fake_target_probs, phn_mask).mean()
 
         batch_size = len(batch['source'])
         real_target_idx, batch_target_len = get_target_batch(batch_size)
@@ -181,37 +185,45 @@ class SegmentGANModel(ModelBase):
         self.g_opt.zero_grad()
 
         gen = self.generate(batch)
-        fake_target_logits, noisy_fake_target_logits, mask = gen['fake_target_logits'], gen['noisy_fake_target_logits'], gen['mask']
+        fake_target_logits, noisy_fake_target_logits, phn_mask = gen['fake_target_logits'], gen['noisy_fake_target_logits'], gen['phn_mask']
 
-        fake_target_probs = F.softmax(fake_target_logits / frame_temp, dim=-1)
-        fake_score = self.critic(fake_target_probs, mask).mean()  # shape: (N, 1)
+        # fake_target_probs = F.softmax(fake_target_logits / frame_temp, dim=-1)
+        # fake_score = self.critic(fake_target_probs, phn_mask).mean()  # shape: (N, 1)
 
-        noisy_fake_target_probs = F.softmax(noisy_fake_target_logits / frame_temp, dim=-1)
-        segment_loss = ((fake_target_probs - noisy_fake_target_probs) ** 2).sum(-1).mean()
+        # noisy_fake_target_probs = F.softmax(noisy_fake_target_logits / frame_temp, dim=-1)
+        # segment_loss = ((fake_target_probs - noisy_fake_target_probs) ** 2).sum(-1).mean()
 
-        g_loss = -fake_score
-        total_loss = g_loss + self.config.seg_loss_ratio * segment_loss
+        # g_loss = -fake_score
+
+        feats, selected_feats, selected_indices, feat_mask = gen['feats'], gen['selected_feats'], gen['selected_indices'], gen['feat_mask']
+        recon_input = torch.cat([selected_feats, selected_indices.unsqueeze(2) / self.config.feat_max_length], dim=-1)  # (N, phn_max_length, feat_dim + 1)
+        reconstruction = self.reconstruction_net(recon_input, phn_mask)
+        recon_loss = masked_reduce_mean((reconstruction - feats) ** 2, feat_mask).mean()
+
+        # total_loss = g_loss + self.config.seg_loss_ratio * segment_loss + self.config.recon_loss_ratio * recon_loss
+        total_loss = recon_loss
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.generator.parameters()) + list(self.segment_map_generator.parameters()),
+            list(self.generator.parameters()) + list(self.segment_map_generator.parameters()) + list(self.reconstruction_net.parameters()),
             5.
         )
         self.g_opt.step()
 
-        mask = mask.squeeze()  # (N, T)
-        lengths = mask.sum(dim=-1).cpu().data.numpy()  # (N,)
+        phn_mask = phn_mask.squeeze()  # (N, T)
+        lengths = phn_mask.sum(dim=-1).cpu().data.numpy()  # (N,)
         true_lengths = np.array([len(bnd) for bnd in batch['source_bnd']], dtype=float)
         length_correlation = pearsonr(lengths, true_lengths)[0]
 
-        fake_sample = torch.argmax(fake_target_probs[0], dim=-1).long() * mask[0].long()
+        # fake_sample = torch.argmax(fake_target_probs[0], dim=-1).long() * phn_mask[0].long()
         logger.update({
-            'g_loss': g_loss.item(),
+            # 'g_loss': g_loss.item(),
         }, group_name='GAN_losses')
         logger.update({
-            'seg_loss': segment_loss.item(),
+            # 'seg_loss': segment_loss.item(),
         }, group_name='segment_losses')
         logger.update({
-            'fake_sample': array_to_string(fake_sample.cpu().data.numpy()),
+            'recon_loss': recon_loss.item(),
+            # 'fake_sample': array_to_string(fake_sample.cpu().data.numpy()),
             'mean_fake_length': np.mean(lengths),
             'std_fake_length': np.std(lengths),
             'length_correlation': length_correlation
@@ -310,26 +322,22 @@ class SegmentMapGenerator(nn.Module):
 
     def __init__(self, config, num_segment_map_param: int):
         super().__init__()
-        self.embedding = nn.Linear(config.feat_dim, config.dis_emb_size, bias=False)
+        self.embedding = nn.Linear(config.feat_dim, config.dis_emb_size)
         self.num_segment_map_param = num_segment_map_param
 
         self.layers = nn.Sequential(
             nn.LeakyReLU(),
-            nn.Conv1d(config.dis_emb_size, config.dis_emb_size // 2, kernel_size=9),
-            nn.MaxPool1d(2),
+            nn.Conv1d(config.dis_emb_size, config.dis_emb_size, kernel_size=9, stride=2),
             nn.LeakyReLU(),
-            nn.Conv1d(config.dis_emb_size // 2, config.dis_emb_size // 4, kernel_size=9),
-            nn.MaxPool1d(2),
+            nn.Conv1d(config.dis_emb_size, config.dis_emb_size, kernel_size=9, stride=2),
             nn.LeakyReLU(),
-            nn.Conv1d(config.dis_emb_size // 4, config.dis_emb_size // 8, kernel_size=9),
-        )
-        self.rnn = nn.LSTM(
-            input_size=config.dis_emb_size // 8, hidden_size=config.dis_emb_size // 16, bidirectional=True
+            nn.Conv1d(config.dis_emb_size, config.dis_emb_size, kernel_size=9, stride=2),
+            nn.LeakyReLU(),
+            nn.Conv1d(config.dis_emb_size, config.dis_emb_size, kernel_size=9, stride=2),
         )
         self.out = nn.Sequential(
             nn.LeakyReLU(),
-            nn.Linear(config.dis_emb_size // 8, 1),
-            nn.Sigmoid(),
+            nn.Linear(config.dis_emb_size, self.num_segment_map_param),
         )
 
     def forward(self, x, mask):
@@ -338,97 +346,31 @@ class SegmentMapGenerator(nn.Module):
         e = self.embedding(x)
         N, T, E = e.shape
         e = e.view(N, E, T)
-        x = self.layers(e)   # (N, E', T)
-        x = x.transpose(1, 2)
-        x, _ = self.rnn(x)  # (N, T, E'')
-        x = self.out(x)[:, :self.num_segment_map_param, 0] * T  # (N, phn_max_length)
-        x, _ = x.sort()
+        x = self.layers(e)   # (N, config.dis_emb_size, T')
+        x = x.mean(dim=-1)  # (N, config.dis_emb_size)
+        x = self.out(x)  # (N, phn_max_length)
+        x = torch.sigmoid(x - 1) * T
+        x, _ = x.sort(dim=-1)
         return x
 
 
-# class SegmentMapGenerator(nn.Module):
-#
-#     def __init__(self, config, num_segment_map_param: int):
-#         super().__init__()
-#         self.embedding = nn.Linear(config.feat_dim, config.dis_emb_size, bias=False)
-#         self.num_segment_map_param = num_segment_map_param
-#
-#         self.layers = nn.Sequential(
-#             nn.LeakyReLU(),
-#             nn.Conv1d(config.dis_emb_size, config.dis_emb_size // 2, kernel_size=9, padding=9 // 2),
-#             nn.LeakyReLU(),
-#             nn.Conv1d(config.dis_emb_size // 2, config.dis_emb_size // 4, kernel_size=9, padding=9 // 2),
-#             nn.LeakyReLU(),
-#             nn.Conv1d(config.dis_emb_size // 4, 2, kernel_size=9, padding=9 // 2),
-#         )
-#
-#     def _forward(self, x: torch.Tensor, mask: torch.Tensor = None):
-#         # x: (N, T, V)
-#         if mask is not None:
-#             x = x * mask.reshape(*x.shape[:2], 1)
-#
-#         e = self.embedding(x)
-#         N, T, E = e.shape
-#         e = e.view(N, E, T)
-#         x = self.layers(e)  # (N, 2, T)
-#         x = torch.cat([torch.tanh(x[:, 0:1, :]), torch.sigmoid(x[:, 1:2, :] - 3.)], dim=1) * T
-#         return x
-#
-#     @staticmethod
-#     def non_maximum_suppression(x: torch.Tensor, phn_max_length: int, mask: torch.Tensor = None):
-#         if mask is None:
-#             mask = torch.ones_like(x[:, 0, :]).to(x.device)
-#
-#         maxlen = x.shape[-1]
-#         taken_mask = (1 - mask.long()).cpu()
-#         selected_indices = torch.zeros([len(x), phn_max_length]).long()
-#         selected_mask = torch.zeros_like(selected_indices).float()
-#         cpu_x = x.cpu().data
-#         seq_lens = torch.sum(mask.long(), dim=-1).cpu()
-#         for i in range(len(x)):
-#             seq_len = seq_lens[i]
-#             displacements = cpu_x[i, 0]
-#             distance_to_centers = displacements.abs()
-#             distance_to_centers[seq_len:] = maxlen
-#
-#             for phn_idx in range(phn_max_length):
-#                 if taken_mask[i].sum() == maxlen:
-#                     break
-#                 min_index = distance_to_centers.argmin().item()
-#                 displacement = displacements[min_index].item()
-#                 width = cpu_x[i, 1, min_index].item()
-#
-#                 selected_indices[i, phn_idx] = min_index
-#                 selected_mask[i, phn_idx] = 1
-#                 mask_start_index = int(np.clip(min_index + displacement - width / 2, a_min=0, a_max=maxlen - 1))
-#                 mask_end_index = int(np.clip(min_index + displacement + width / 2, a_min=0, a_max=maxlen - 1))
-#
-#                 taken_mask[i, mask_start_index:mask_end_index + 1] = 1
-#                 distance_to_centers[mask_start_index:mask_end_index + 1] = maxlen
-#
-#         selected_indices, selected_mask = selected_indices.to(x.device), selected_mask.to(x.device)
-#         centers = selected_indices.float() + torch.gather(x[:, 0], dim=1, index=selected_indices)
-#         centers = centers * selected_mask + (1 - selected_mask) * maxlen
-#         return centers
-#
-#     def forward(self, x: torch.Tensor, mask: torch.Tensor = None):
-#         x = self._forward(x, mask)
-#         x = self.non_maximum_suppression(x, self.num_segment_map_param, mask)
-#         x, _ = x.sort(dim=-1)
-#         return x
-
-
-class SegmentMapper(nn.Module):
+class ReconstructionNet(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.phn_max_length = config.phn_max_length
-        self.feat_max_length = config.feat_max_length
+        self.config = config
+        self.embedding = nn.Linear(config.feat_dim + 1, config.feat_dim, bias=False)
+        self.encoder = nn.GRU(config.feat_dim, config.feat_dim, batch_first=True)
+        self.decoder = nn.GRU(config.feat_dim, config.feat_dim, batch_first=True)
 
-    def get_feat_indices(self, segment_map_params: torch.Tensor) -> torch.Tensor:
-        # segment_map_params: (batch_size, phn_max_length)
-        return segment_map_params
+    def forward(self, x, mask=None):
+        # X: (N, T, E)
+        if mask is not None:
+            x = x * mask.reshape(*x.shape[:2], 1)
+        e = self.embedding(x)
 
-    @property
-    def n_param(self) -> int:
-        return self.phn_max_length
+        encoder_outputs, encoder_hiddens = self.encoder(e)
+
+        decoder_inputs = e.repeat(1, math.ceil(self.config.feat_max_length / x.shape[1]), 1)[:, :self.config.feat_max_length]
+        decoder_outputs, decoder_hiddens = self.decoder(decoder_inputs, encoder_outputs[:, -1].unsqueeze(0))
+        return decoder_outputs

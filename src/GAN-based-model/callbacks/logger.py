@@ -1,4 +1,5 @@
 from tensorboardX import SummaryWriter
+import numpy as np
 
 
 class Logger:
@@ -16,6 +17,7 @@ class Logger:
 
     def update(self, items: dict, ema=True, group_name=None):
         for key, val in items.items():
+            val = np.nan_to_num(val, posinf=0.)
             if key not in self.values or not ema:
                 self.values[key] = val
             else:
